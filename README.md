@@ -1,4 +1,4 @@
-**PURPOSE:   Merge Sync 2 directories such as PC and Mobile Obsidian Vaults**
+**PURPOSE:   Merge-Sync 2 directories such as PC and Mobile Obsidian Vaults**
 
 git clone [https://github.com/pilgrim53/vault_merge.git](https://github.com/pilgrim53/vault_merge.git)
 
