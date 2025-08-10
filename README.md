@@ -17,4 +17,6 @@ Go to MAIN and update:
 5. Copy merge_dir/vault to PC vault area
 6. Copy merge_dir/vault to mobile vault area
 
-*NOTE: If you have confidence, you can change the program to update the stage and pc vaults directly However you can not update the mobile device directly from the PC (hence the need for this program in the first place)*
+*NOTE1: If you have confidence, you can change the program to update the stage and pc vaults directly However you can not update the mobile device directly from the PC (hence the need for this program in the first place)*
+
+*NOTE2: For file deletions, you will need to manually delete the file from each vault*
