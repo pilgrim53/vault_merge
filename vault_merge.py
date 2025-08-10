@@ -4,15 +4,9 @@ from pathlib import Path
 from datetime import datetime, timedelta 
 import os
 import shutil
-import argparse
 
 
-
-def cool_vault():
-    VAULT_DIR = Path("C:\\Users\\Martin\\OneDrive\\Martin PKM")
-
-    # VAULT_DIR = Path("This PC\\Martin's S24 FE\\Internal storage\\Documents\\Martin PKM")
-
+def cool_vault(VAULT_DIR):
     vault = otools.Vault(VAULT_DIR).connect().gather()
 
     print(f"Connected?: {vault.is_connected}")
@@ -21,9 +15,7 @@ def cool_vault():
     vault.dirpath
 
     # vault.md_file_index
-
     # vault.isolated_notes
-
     # vault.nonexistent_notes
 
     df = vault.get_note_metadata()
@@ -110,8 +102,6 @@ def copy_file(source_path, dest_path):
     shutil.copy2(source_path, dest_path)
     # print(f"Copied: {source_path} → {dest_path}")
 
-
-
 def merge_directories(time_float, PC_DIR, PHONE_DIR, merged_dir):
     phone_files = gather_files(PHONE_DIR)
     pc_files = gather_files(PC_DIR)
@@ -129,20 +119,9 @@ def merge_directories(time_float, PC_DIR, PHONE_DIR, merged_dir):
         phone_info = phone_files.get(rel_path)
         pc_info = pc_files.get(rel_path)
 
-        if "Tai Chi" in rel_path:
-            c_count += 1
-            print(f"Found Tai Chi file: {rel_path}")
-            print(f"PC modified at ({pc_info[1]}) {datetime.fromtimestamp(pc_info[1])}") 
-            print(f"Phone modified at ({phone_info[1]}  {datetime.fromtimestamp(phone_info[1])}") 
-            if pc_info[1] > time_float :
-                print("PC file is newer than Time Check")
-            if pc_info[1] > phone_info[1]:
-                print("Phone file is older than PC file")
-
         if phone_info and pc_info:
             # File exists in both — compare mod time
             # print(f"Comparing files: {phone_info[0]} and {pc_info[0] } for {rel_path} ")
-
 
             if pc_info[1] > time_float and pc_info[1] > phone_info[1]:
                 src_file = pc_info[0]
@@ -171,7 +150,7 @@ def merge_directories(time_float, PC_DIR, PHONE_DIR, merged_dir):
 def main():
 
     # Ideally we'd like to work with this android path
-    # Phone_Vault = Path("This PC\\Martin's S24 FE\\Internal storage\\Documents\\Martin PKM")
+    # Phone_Vault = Path("This PC\\<your mobile device>\\Internal storage\\Documents\\<vault>")
 
     PHONE_DIR = Path("C:\\Users\\Martin\\Local_Stage\\Martin PKM")
     PC_DIR = Path("C:\\Users\\Martin\\OneDrive\\Martin PKM")
@@ -183,7 +162,6 @@ def main():
     )   
     print("Oldest file in Phone Vault is from:", datetime.fromtimestamp(Time_Check))
     print("Checking for PC files modified after this time...")
-
 
     merge_directories(Time_Check, PC_DIR, PHONE_DIR, MERGE_DIR)
 
