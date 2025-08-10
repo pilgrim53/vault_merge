@@ -1,6 +1,9 @@
 # vault_merge
 Merge Sync 2 directories such as PC and Mobile Obsidian Vaults
 
+git clone https://github.com/pilgrim53/vault_merge.git
+create your venv using requirements.txt
+
 
 1) On your mobile device, zip/compress your vault directory  (I use CX File Explorer)
    NOTE:  You NEED to do this in order to preserve your file modified times
