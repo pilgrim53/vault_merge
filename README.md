@@ -2,7 +2,13 @@
 Merge Sync 2 directories such as PC and Mobile Obsidian Vaults
 
 git clone https://github.com/pilgrim53/vault_merge.git
+
 create your venv using requirements.txt
+
+Go to MAIN and update:
+    PHONE_DIR = Path("Where is your phone vault")
+    PC_DIR = Path("Where is your PC vault")
+    MERGE_DIR = Path("Where to put the merged vault")
 
 
 1) On your mobile device, zip/compress your vault directory  (I use CX File Explorer)
