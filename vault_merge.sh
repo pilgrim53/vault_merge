@@ -1,4 +1,4 @@
 echo "Are Saphira and phone properly mounted?"
 read A
-. /home/tinker/gitlab/API_venv/bin/activate
-/home/tinker/gitlab/API_venv/bin/python /home/tinker/gitlab/vault_merge/vault_merge_kali.py
+. ~/gitlab/obsidian_venv/bin/activate
+~/gitlab/obsidian_venv/bin/python ./vault_merge.py
