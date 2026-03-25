@@ -110,32 +110,24 @@ def detect_moved_files(pc_files, phone_files):
                 print(f"    size: {phone_size} bytes")
                 print(f"    mtime: {datetime.fromtimestamp(phone_mtime)}")
 
-                if pc_mtime > phone_mtime:
-                    newest_side = 'PC'
-                    newest_rel = pc_rel
-                    oldest_side = 'Phone'
-                else:
-                    newest_side = 'Phone'
-                    newest_rel = phone_rel
-                    oldest_side = 'PC'
+                print('Choose which side to keep for this moved/renamed duplicate:')
+                print('  1) PC version')
+                print('  2) Phone version')
+                print('  3) Keep both (default)')
 
                 while True:
-                    decision = input(
-                        "Accept most recent version (1) or keep both files (2)? [1/2]: "
-                    ).strip()
-                    if decision not in ('1', '2'):
-                        print('Please enter 1 or 2.')
+                    decision = input('Enter 1, 2, or 3 [3]: ').strip() or '3'
+                    if decision not in ('1', '2', '3'):
+                        print('Please enter 1, 2, or 3.')
                         continue
                     break
 
                 if decision == '1':
-                    print(f"Keeping newest version from {newest_side} and ignoring older path on {oldest_side}.")
-                    if oldest_side == 'PC':
-                        if pc_rel in pc_files:
-                            pc_files.pop(pc_rel, None)
-                    else:
-                        if phone_rel in phone_files:
-                            phone_files.pop(phone_rel, None)
+                    print('Keeping PC version and dropping Phone path from merge set.')
+                    phone_files.pop(phone_rel, None)
+                elif decision == '2':
+                    print('Keeping Phone version and dropping PC path from merge set.')
+                    pc_files.pop(pc_rel, None)
                 else:
                     print('Keeping both files. Merge will treat them as independent files.')
 
