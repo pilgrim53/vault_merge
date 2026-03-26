@@ -30,6 +30,9 @@ def gather_files(base_dir):
     for root, _, filenames in os.walk(base_dir):
         for fname in filenames:
             full_path = os.path.join(root, fname)
+            # Skip .obsidian and .trash paths entirely
+            if ".obsidian" in full_path or ".trash" in full_path:
+                continue
             rel_path = os.path.relpath(full_path, base_dir)
             try:
                 stat = os.stat(full_path)
@@ -166,10 +169,11 @@ def copy_file(source_path, dest_path):
     src_str = str(source_path)
     if ".obsidian" in src_str or ".trash" in src_str:
         print(f"Skipping .obsidian file: {source_path}")
-        return
+        return False
     ensure_dir(dest_path)
     print(f"Copying {source_path} to {dest_path}")
     shutil.copy2(source_path, dest_path)
+    return True
 
 
 def merge_directories(pc_dir, phone_dir):
@@ -217,17 +221,21 @@ def merge_directories(pc_dir, phone_dir):
     for rel_path in sorted(phone_only_keys):
         phone_path, _, _ = phone_files[rel_path]
         target_pc_path = os.path.join(str(pc_dir), rel_path)
-        copy_file(phone_path, target_pc_path)
-        copied_from_phone += 1
-        print(f"Copied new file from Phone to PC: {rel_path}")
+        if copy_file(phone_path, target_pc_path):
+            copied_from_phone += 1
+            print(f"Copied new file from Phone to PC: {rel_path}")
+        else:
+            print(f"Skipped Phone-only file: {rel_path}")
 
     # Handle PC-only files
     for rel_path in sorted(pc_only_keys):
         pc_path, _, _ = pc_files[rel_path]
         target_phone_path = os.path.join(str(phone_dir), rel_path)
-        copy_file(pc_path, target_phone_path)
-        copied_to_phone += 1
-        print(f"Copied new file from PC to Phone: {rel_path}")
+        if copy_file(pc_path, target_phone_path):
+            copied_to_phone += 1
+            print(f"Copied new file from PC to Phone: {rel_path}")
+        else:
+            print(f"Skipped PC-only file: {rel_path}")
 
     print(f"Files copied from Phone to PC: {copied_from_phone}")
     print(f"Files copied from PC to Phone: {copied_to_phone}")
