@@ -2,6 +2,7 @@ from pathlib import Path
 from datetime import datetime
 import os
 import shutil
+import hashlib
 import obsidiantools.api as otools
 import pandas as pd
 import shlex
@@ -24,15 +25,113 @@ def connect_and_report_vault(vault_dir: Path):
 
 
 def gather_files(base_dir):
-    """Return a dict mapping relative file paths to (absolute path, mod time)."""
+    """Return a dict mapping relative file paths to (absolute path, mod time, size)."""
     files = {}
     for root, _, filenames in os.walk(base_dir):
         for fname in filenames:
             full_path = os.path.join(root, fname)
             rel_path = os.path.relpath(full_path, base_dir)
-            mod_time = os.path.getmtime(full_path)
-            files[rel_path] = (full_path, mod_time)
+            try:
+                stat = os.stat(full_path)
+            except OSError:
+                continue
+            mod_time = stat.st_mtime
+            size = stat.st_size
+            files[rel_path] = (full_path, mod_time, size)
     return files
+
+
+def get_file_hash(path):
+    """Compute SHA1 hash for a file."""
+    h = hashlib.sha1()
+    with open(path, 'rb') as f:
+        for chunk in iter(lambda: f.read(8192), b''):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def detect_moved_files(pc_files, phone_files):
+    """Detect renamed/moved duplicates (same content, different rel_path) and prompt user."""
+    print("Checking for moved/renamed matches across PC and Phone...")
+
+    # pre-filter by size to reduce hash work
+    pc_by_size = {}
+    phone_by_size = {}
+    for rel, (_path, _mtime, size) in pc_files.items():
+        pc_by_size.setdefault(size, []).append(rel)
+    for rel, (_path, _mtime, size) in phone_files.items():
+        phone_by_size.setdefault(size, []).append(rel)
+
+    # only compute hashes for sizes that exist in both vaults
+    candidate_sizes = set(pc_by_size).intersection(phone_by_size)
+    pc_hash_map = {}
+    phone_hash_map = {}
+
+    for size in candidate_sizes:
+        for rel in pc_by_size[size]:
+            abs_path, mtime, _ = pc_files[rel]
+            try:
+                h = get_file_hash(abs_path)
+            except OSError:
+                continue
+            pc_hash_map.setdefault(h, []).append((rel, abs_path, mtime, size))
+
+        for rel in phone_by_size[size]:
+            abs_path, mtime, _ = phone_files[rel]
+            try:
+                h = get_file_hash(abs_path)
+            except OSError:
+                continue
+            phone_hash_map.setdefault(h, []).append((rel, abs_path, mtime, size))
+
+    handled_hashes = set()
+    for h in set(pc_hash_map).intersection(phone_hash_map):
+        # for same content in both vaults, check if path changed
+        pc_entries = pc_hash_map[h]
+        phone_entries = phone_hash_map[h]
+
+        for pc_entry in pc_entries:
+            for phone_entry in phone_entries:
+                pc_rel, pc_abs, pc_mtime, pc_size = pc_entry
+                phone_rel, phone_abs, phone_mtime, phone_size = phone_entry
+
+                if pc_rel == phone_rel:
+                    continue
+
+                if h in handled_hashes:
+                    continue
+
+                handled_hashes.add(h)
+                print("\nMoved/renamed candidate found:")
+                print(f"  PC : {pc_rel}")
+                print(f"    size: {pc_size} bytes")
+                print(f"    mtime: {datetime.fromtimestamp(pc_mtime)}")
+                print(f"  Phone: {phone_rel}")
+                print(f"    size: {phone_size} bytes")
+                print(f"    mtime: {datetime.fromtimestamp(phone_mtime)}")
+
+                print('Choose which side to keep for this moved/renamed duplicate:')
+                print('  1) PC version')
+                print('  2) Phone version')
+                print('  3) Keep both (default)')
+
+                while True:
+                    decision = input('Enter 1, 2, or 3 [3]: ').strip() or '3'
+                    if decision not in ('1', '2', '3'):
+                        print('Please enter 1, 2, or 3.')
+                        continue
+                    break
+
+                if decision == '1':
+                    print('Keeping PC version and dropping Phone path from merge set.')
+                    phone_files.pop(phone_rel, None)
+                elif decision == '2':
+                    print('Keeping Phone version and dropping PC path from merge set.')
+                    pc_files.pop(pc_rel, None)
+                else:
+                    print('Keeping both files. Merge will treat them as independent files.')
+
+    return pc_files, phone_files
 
 
 def ensure_dir(path):
@@ -45,9 +144,9 @@ def ensure_dir(path):
 
 def copy_file(source_path, dest_path):
     """Copy a file to the destination, creating directories as needed."""
-    # Convert paths to strings and quote them to handle spaces
-    # source_path = shlex.quote(str(Path(source_path).as_posix()))
-    # dest_path = shlex.quote(str(Path(dest_path).as_posix()))
+    # Use pathlib.Path so spaces are handled naturally (no shell quoting needed)
+    source_path = Path(source_path)
+    dest_path = Path(dest_path)
 
     # Skip any path that contains a .obsidian directory (handles both ".obsidian" and "/.obsidian")
     src_str = str(source_path)
@@ -63,6 +162,10 @@ def merge_directories(pc_dir, phone_dir):
     """Merge files bi-directionally between PC and phone directories."""
     phone_files = gather_files(phone_dir)
     pc_files = gather_files(pc_dir)
+
+    # Detect moved/renamed files before path-based merge
+    pc_files, phone_files = detect_moved_files(pc_files, phone_files)
+
     copied_from_phone = 0
     copied_to_phone = 0
     skipped = 0
@@ -80,8 +183,8 @@ def merge_directories(pc_dir, phone_dir):
 
     # Handle files that exist in both locations
     for rel_path in sorted(common_keys):
-        phone_path, phone_mtime = phone_files[rel_path]
-        pc_path, pc_mtime = pc_files[rel_path]
+        phone_path, phone_mtime, _ = phone_files[rel_path]
+        pc_path, pc_mtime, _ = pc_files[rel_path]
         
         if phone_mtime > pc_mtime:
             # Phone has newer version -> update PC
@@ -98,7 +201,7 @@ def merge_directories(pc_dir, phone_dir):
 
     # Handle phone-only files
     for rel_path in sorted(phone_only_keys):
-        phone_path, _ = phone_files[rel_path]
+        phone_path, _, _ = phone_files[rel_path]
         target_pc_path = os.path.join(str(pc_dir), rel_path)
         copy_file(phone_path, target_pc_path)
         copied_from_phone += 1
@@ -106,7 +209,7 @@ def merge_directories(pc_dir, phone_dir):
 
     # Handle PC-only files
     for rel_path in sorted(pc_only_keys):
-        pc_path, _ = pc_files[rel_path]
+        pc_path, _, _ = pc_files[rel_path]
         target_phone_path = os.path.join(str(phone_dir), rel_path)
         copy_file(pc_path, target_phone_path)
         copied_to_phone += 1
@@ -118,8 +221,8 @@ def merge_directories(pc_dir, phone_dir):
 
 
 def main():
-    PHONE_DIR = Path("/home/tinker/Android/Internal storage/Documents/Martin PKM")
-    PC_DIR = Path("/mnt/saphira/PKM")
+    PHONE_DIR = Path("/mnt/android/Internal storage/Documents/Martin PKM")
+    PC_DIR = Path("/mnt/saphira/home/PKM")
 
     print("Merging new/updated files from Phone directly into PC directory...")
     print("Phone Directory:", PHONE_DIR)
