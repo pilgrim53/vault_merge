@@ -144,9 +144,9 @@ def ensure_dir(path):
 
 def copy_file(source_path, dest_path):
     """Copy a file to the destination, creating directories as needed."""
-    # Convert paths to strings and quote them to handle spaces
-    # source_path = shlex.quote(str(Path(source_path).as_posix()))
-    # dest_path = shlex.quote(str(Path(dest_path).as_posix()))
+    # Use pathlib.Path so spaces are handled naturally (no shell quoting needed)
+    source_path = Path(source_path)
+    dest_path = Path(dest_path)
 
     # Skip any path that contains a .obsidian directory (handles both ".obsidian" and "/.obsidian")
     src_str = str(source_path)
@@ -201,7 +201,7 @@ def merge_directories(pc_dir, phone_dir):
 
     # Handle phone-only files
     for rel_path in sorted(phone_only_keys):
-        phone_path, _ = phone_files[rel_path]
+        phone_path, _, _ = phone_files[rel_path]
         target_pc_path = os.path.join(str(pc_dir), rel_path)
         copy_file(phone_path, target_pc_path)
         copied_from_phone += 1
@@ -209,7 +209,7 @@ def merge_directories(pc_dir, phone_dir):
 
     # Handle PC-only files
     for rel_path in sorted(pc_only_keys):
-        pc_path, _ = pc_files[rel_path]
+        pc_path, _, _ = pc_files[rel_path]
         target_phone_path = os.path.join(str(phone_dir), rel_path)
         copy_file(pc_path, target_phone_path)
         copied_to_phone += 1
