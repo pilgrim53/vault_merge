@@ -125,9 +125,21 @@ def detect_moved_files(pc_files, phone_files):
                 if decision == '1':
                     print('Keeping PC version and dropping Phone path from merge set.')
                     phone_files.pop(phone_rel, None)
+                    # Delete the phone version file
+                    try:
+                        os.remove(phone_abs)
+                        print(f'Deleted: {phone_abs}')
+                    except OSError as e:
+                        print(f'Error deleting {phone_abs}: {e}')
                 elif decision == '2':
                     print('Keeping Phone version and dropping PC path from merge set.')
                     pc_files.pop(pc_rel, None)
+                    # Delete the PC version file
+                    try:
+                        os.remove(pc_abs)
+                        print(f'Deleted: {pc_abs}')
+                    except OSError as e:
+                        print(f'Error deleting {pc_abs}: {e}')
                 else:
                     print('Keeping both files. Merge will treat them as independent files.')
 
