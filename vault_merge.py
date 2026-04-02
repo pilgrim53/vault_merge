@@ -53,7 +53,7 @@ def get_file_hash(path):
     return h.hexdigest()
 
 
-def detect_moved_files(pc_files, phone_files):
+def detect_moved_files(pc_files, phone_files, pc_dir, phone_dir):
     """Detect renamed/moved duplicates (same content, different rel_path) and prompt user."""
     print("Checking for moved/renamed matches across PC and Phone...")
 
@@ -127,26 +127,76 @@ def detect_moved_files(pc_files, phone_files):
 
                 if decision == '1':
                     print('Keeping PC version and dropping Phone path from merge set.')
-                    phone_files.pop(phone_rel, None)
-                    pc_files.pop(pc_rel, None)  # Prevent copying PC version to phone
                     # Delete the phone version file
                     try:
                         os.remove(phone_abs)
                         print(f'Deleted: {phone_abs}')
                     except OSError as e:
                         print(f'Error deleting {phone_abs}: {e}')
+                    # Delete the discarded path on PC if it exists
+                    discarded_on_pc = os.path.join(str(pc_dir), phone_rel)
+                    if os.path.exists(discarded_on_pc):
+                        try:
+                            os.remove(discarded_on_pc)
+                            print(f'Deleted discarded path on PC: {discarded_on_pc}')
+                        except OSError as e:
+                            print(f'Error deleting {discarded_on_pc}: {e}')
+                    # Add comment to kept file
+                    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                    comment = f"  {pc_rel}  kept after de-duplication at {timestamp}\n"
+                    try:
+                        with open(pc_abs, 'a') as f:
+                            f.write(comment)
+                        print(f'Added de-duplication comment to: {pc_abs}')
+                    except OSError as e:
+                        print(f'Error adding comment to {pc_abs}: {e}')
+                    phone_files.pop(phone_rel, None)
+                    # Keep pc_rel in pc_files so it gets copied to phone if needed
                 elif decision == '2':
                     print('Keeping Phone version and dropping PC path from merge set.')
-                    pc_files.pop(pc_rel, None)
-                    phone_files.pop(phone_rel, None)  # Prevent copying phone version to PC
                     # Delete the PC version file
                     try:
                         os.remove(pc_abs)
                         print(f'Deleted: {pc_abs}')
                     except OSError as e:
                         print(f'Error deleting {pc_abs}: {e}')
+                    # Delete the discarded path on phone if it exists
+                    discarded_on_phone = os.path.join(str(phone_dir), pc_rel)
+                    if os.path.exists(discarded_on_phone):
+                        try:
+                            os.remove(discarded_on_phone)
+                            print(f'Deleted discarded path on phone: {discarded_on_phone}')
+                        except OSError as e:
+                            print(f'Error deleting {discarded_on_phone}: {e}')
+                    # Add comment to kept file
+                    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                    comment = f"  {phone_rel}  kept after de-duplication at {timestamp}\n"
+                    try:
+                        with open(phone_abs, 'a') as f:
+                            f.write(comment)
+                        print(f'Added de-duplication comment to: {phone_abs}')
+                    except OSError as e:
+                        print(f'Error adding comment to {phone_abs}: {e}')
+                    pc_files.pop(pc_rel, None)
+                    # Keep phone_rel in phone_files so it gets copied to PC if needed
                 else:
                     print('Keeping both files. Merge will treat them as independent files.')
+                    # Add comments to both files to differentiate them
+                    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                    pc_comment = f"  {pc_rel}  kept after de-duplication at {timestamp}\n"
+                    phone_comment = f"  {phone_rel}  kept after de-duplication at {timestamp}\n"
+                    try:
+                        with open(pc_abs, 'a') as f:
+                            f.write(pc_comment)
+                        print(f'Added de-duplication comment to PC file: {pc_abs}')
+                    except OSError as e:
+                        print(f'Error adding comment to {pc_abs}: {e}')
+                    try:
+                        with open(phone_abs, 'a') as f:
+                            f.write(phone_comment)
+                        print(f'Added de-duplication comment to Phone file: {phone_abs}')
+                    except OSError as e:
+                        print(f'Error adding comment to {phone_abs}: {e}')
 
     return pc_files, phone_files
 
@@ -182,7 +232,7 @@ def merge_directories(pc_dir, phone_dir):
     pc_files = gather_files(pc_dir)
 
     # Detect moved/renamed files before path-based merge
-    pc_files, phone_files = detect_moved_files(pc_files, phone_files)
+    pc_files, phone_files = detect_moved_files(pc_files, phone_files, pc_dir, phone_dir)
 
     copied_from_phone = 0
     copied_to_phone = 0
@@ -204,12 +254,12 @@ def merge_directories(pc_dir, phone_dir):
         phone_path, phone_mtime, _ = phone_files[rel_path]
         pc_path, pc_mtime, _ = pc_files[rel_path]
         
-        if phone_mtime > pc_mtime:
+        if phone_mtime > pc_mtime and os.path.exists(phone_path):
             # Phone has newer version -> update PC
             copy_file(phone_path, pc_path)
             copied_from_phone += 1
             print(f"Copied newer Phone file to PC: {rel_path}")
-        elif pc_mtime > phone_mtime:
+        elif pc_mtime > phone_mtime and os.path.exists(pc_path):
             # PC has newer version -> update Phone
             copy_file(pc_path, phone_path)
             copied_to_phone += 1
@@ -221,7 +271,7 @@ def merge_directories(pc_dir, phone_dir):
     for rel_path in sorted(phone_only_keys):
         phone_path, _, _ = phone_files[rel_path]
         target_pc_path = os.path.join(str(pc_dir), rel_path)
-        if copy_file(phone_path, target_pc_path):
+        if os.path.exists(phone_path) and copy_file(phone_path, target_pc_path):
             copied_from_phone += 1
             print(f"Copied new file from Phone to PC: {rel_path}")
         else:
@@ -231,7 +281,7 @@ def merge_directories(pc_dir, phone_dir):
     for rel_path in sorted(pc_only_keys):
         pc_path, _, _ = pc_files[rel_path]
         target_phone_path = os.path.join(str(phone_dir), rel_path)
-        if copy_file(pc_path, target_phone_path):
+        if os.path.exists(pc_path) and copy_file(pc_path, target_phone_path):
             copied_to_phone += 1
             print(f"Copied new file from PC to Phone: {rel_path}")
         else:
