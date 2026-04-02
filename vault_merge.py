@@ -45,8 +45,8 @@ def gather_files(base_dir):
 
 
 def get_file_hash(path):
-    """Compute SHA1 hash for a file."""
-    h = hashlib.sha1()
+    """Compute SHA256 hash for a file."""
+    h = hashlib.sha256()
     with open(path, 'rb') as f:
         for chunk in iter(lambda: f.read(8192), b''):
             h.update(chunk)
