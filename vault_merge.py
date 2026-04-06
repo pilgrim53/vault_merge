@@ -3,10 +3,10 @@ from datetime import datetime
 import os
 import shutil
 import hashlib
+import sqlite3
+import sys
 import obsidiantools.api as otools
 import pandas as pd
-import shlex
-
 
 def connect_and_report_vault(vault_dir: Path):
     """Connects to an Obsidian vault and prints connection status and recent notes."""
@@ -70,22 +70,46 @@ def detect_moved_files(pc_files, phone_files, pc_dir, phone_dir):
     pc_hash_map = {}
     phone_hash_map = {}
 
+    spinner = ['|', '/', '-', '\\']
+    spinner_index = 0
+    total_files = sum(len(pc_by_size[size]) + len(phone_by_size[size]) for size in candidate_sizes)
+    processed_files = 0
+
+    def show_progress():
+        nonlocal spinner_index, processed_files
+        spinner_char = spinner[spinner_index % len(spinner)]
+        sys.stdout.write(f"\r  Checking renamed/moved files... {processed_files}/{total_files} {spinner_char}")
+        sys.stdout.flush()
+        spinner_index += 1
+
     for size in candidate_sizes:
         for rel in pc_by_size[size]:
             abs_path, mtime, _ = pc_files[rel]
             try:
                 h = get_file_hash(abs_path)
             except OSError:
+                processed_files += 1
+                show_progress()
                 continue
             pc_hash_map.setdefault(h, []).append((rel, abs_path, mtime, size))
+            processed_files += 1
+            show_progress()
 
         for rel in phone_by_size[size]:
             abs_path, mtime, _ = phone_files[rel]
             try:
                 h = get_file_hash(abs_path)
             except OSError:
+                processed_files += 1
+                show_progress()
                 continue
             phone_hash_map.setdefault(h, []).append((rel, abs_path, mtime, size))
+            processed_files += 1
+            show_progress()
+
+    if total_files:
+        sys.stdout.write('\r  Checking renamed/moved files... done.        \n')
+        sys.stdout.flush()
 
     handled_hashes = set()
     for h in set(pc_hash_map).intersection(phone_hash_map):
@@ -292,15 +316,168 @@ def merge_directories(pc_dir, phone_dir):
     print(f"Files skipped (same in both): {skipped}")
 
 
+# ========== KOBO IMPORT FUNCTIONALITY ==========
+
+def connect_db(db_path: str):
+    """Connect to Kobo SQLite database."""
+    if not os.path.exists(db_path):
+        raise FileNotFoundError(f"Cannot find Kobo database at: {db_path}")
+    return sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+
+
+def get_recent_highlights(conn):
+    """
+    Returns list of rows from Kobo database:
+    (book_id, book_title, author, highlight_text, annotation, highlight_datetime)
+    """
+    cur = conn.cursor()
+
+    query = """
+    SELECT
+        c.ContentID      AS book_id,
+        c.Title          AS title,
+        c.Attribution    AS author,
+        b.Text           AS highlight_text,
+        b.Annotation     AS note_text,
+        b.DateCreated    AS created_at
+    FROM Bookmark b
+    JOIN content c ON b.VolumeID = c.ContentID
+    WHERE b.Text IS NOT NULL
+      AND b.Text <> ''
+    ORDER BY c.Title, b.StartContainerPath;
+    """
+
+    cur.execute(query)
+    rows = cur.fetchall()
+    return rows
+
+
+def ensure_output_dir(output_dir):
+    """Ensure output directory exists."""
+    os.makedirs(output_dir, exist_ok=True)
+
+
+def sanitize_filename(name: str) -> str:
+    """Make filename filesystem-safe."""
+    bad_chars = ['/', '\\', ':', '*', '?', '"', '<', '>', '|']
+    for ch in bad_chars:
+        name = name.replace(ch, "-")
+    return name.strip().replace("  ", " ")
+
+
+def write_to_obsidian(highlights, output_dir):
+    """
+    Group highlights by book and write/append markdown files per book.
+    """
+    ensure_output_dir(output_dir)
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+
+    # Group by book_id
+    books = {}
+    for book_id, title, author, h_text, note_text, created_at in highlights:
+        books.setdefault(book_id, {
+            "title": title or "Untitled",
+            "author": author or "Unknown",
+            "items": []
+        })
+        books[book_id]["items"].append({
+            "highlight": h_text.strip(),
+            "note": (note_text or "").strip(),
+            "created_at": created_at
+        })
+
+    for book_id, data in books.items():
+        title = data["title"]
+        author = data["author"]
+        # Use only the first 2 names of the author if multiple
+        author = " ".join(author.split(" ")[:2]) if author else "Unknown"
+    
+        filename = sanitize_filename(f"{title} - {author}.md")
+        path = os.path.join(output_dir, filename)
+
+        # If file does not exist, create with header
+        if not os.path.exists(path):
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(f"# {title}\n")
+                f.write(f"**Author**: {author}\n\n")
+                f.write(f"_Kobo highlights imported on {now_str}_\n\n")
+
+        # Append highlights
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(f"\n## Import {now_str}\n\n")
+            for item in data["items"]:
+                h = item["highlight"]
+                note = item["note"]
+                f.write(f"> {h}\n\n")
+                if note:
+                    f.write(f"- **Note**: {note}\n\n")
+
+
+def kobo_import(kobo_mount_path, obsidian_vault_path):
+    """Import Kobo highlights into Obsidian vault."""
+    db_path = os.path.join(kobo_mount_path, ".kobo", "KoboReader.sqlite")
+    highlights_subfolder = "Self/Books 2026/Highlights"
+    output_dir = os.path.join(obsidian_vault_path, highlights_subfolder)
+    
+    conn = None
+    try:
+        print(f"Connecting to Kobo database at: {db_path}")
+        conn = connect_db(db_path)
+        highlights = get_recent_highlights(conn)
+
+        if not highlights:
+            print("No highlights found in Kobo database.")
+            return
+
+        print(f"Found {len(highlights)} highlights. Writing to Obsidian...")
+        write_to_obsidian(highlights, output_dir)
+        print(f"Highlights exported to: {output_dir}")
+    except FileNotFoundError as e:
+        print(f"Error: {e}")
+        print("Make sure the Kobo device is mounted at the expected location.")
+    finally:
+        if conn:
+            conn.close()
+
+
 def main():
     PHONE_DIR = Path("/mnt/android/Internal storage/Documents/Martin PKM")
     PC_DIR = Path("/mnt/saphira/home/PKM")
+    KOBO_MOUNT_PATH = "/mnt/kobo"
 
-    print("Merging new/updated files from Phone directly into PC directory...")
-    print("Phone Directory:", PHONE_DIR)
-    print("PC Directory:", PC_DIR)
-
-    merge_directories(PC_DIR, PHONE_DIR)
+    print("\n" + "="*60)
+    print("OBSIDIAN VAULT MERGE & KOBO IMPORT UTILITY")
+    print("="*60)
+    print("\nChoose an operation:")
+    print("  1) Merge files between Phone and PC")
+    print("  2) Import highlights from Kobo device")
+    print("  3) Exit")
+    
+    choice = input("\nEnter your choice (1-3) [1]: ").strip() or "1"
+    
+    if choice == "1":
+        print("\nMerging new/updated files from Phone directly into PC directory...")
+        print("Phone Directory:", PHONE_DIR)
+        print("PC Directory:", PC_DIR)
+        merge_directories(PC_DIR, PHONE_DIR)
+    
+    elif choice == "2":
+        if not os.path.exists(KOBO_MOUNT_PATH):
+            print(f"\nError: Kobo mount path not found: {KOBO_MOUNT_PATH}")
+            print("Please mount your Kobo device first.")
+            return
+        
+        print(f"\nImporting Kobo highlights...")
+        print(f"Kobo Mount Path: {KOBO_MOUNT_PATH}")
+        print(f"PC Directory: {PC_DIR}")
+        kobo_import(KOBO_MOUNT_PATH, str(PC_DIR))
+    
+    elif choice == "3":
+        print("\nExiting...")
+        return
+    
+    else:
+        print("\nInvalid choice. Please enter 1, 2, or 3.")
 
 
 if __name__ == "__main__":
