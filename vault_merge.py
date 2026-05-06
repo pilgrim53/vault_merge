@@ -31,7 +31,7 @@ def gather_files(base_dir):
         for fname in filenames:
             full_path = os.path.join(root, fname)
             # Skip .obsidian and .trash paths entirely
-            if ".obsidian" in full_path or ".trash" in full_path:
+            if ".obsidian" in full_path or ".trash" in full_path or ".smart-env" in full_path:
                 continue
             rel_path = os.path.relpath(full_path, base_dir)
             try:
@@ -165,12 +165,14 @@ def detect_moved_files(pc_files, phone_files, pc_dir, phone_dir):
                             print(f'Deleted discarded path on PC: {discarded_on_pc}')
                         except OSError as e:
                             print(f'Error deleting {discarded_on_pc}: {e}')
-                    # Add comment to kept file
+                    # Add comment to kept file, preserving original timestamp
                     timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                     comment = f"  {pc_rel}  kept after de-duplication at {timestamp}\n"
                     try:
+                        original_mtime = os.stat(pc_abs).st_mtime
                         with open(pc_abs, 'a') as f:
                             f.write(comment)
+                        os.utime(pc_abs, (original_mtime, original_mtime))
                         print(f'Added de-duplication comment to: {pc_abs}')
                     except OSError as e:
                         print(f'Error adding comment to {pc_abs}: {e}')
@@ -192,12 +194,14 @@ def detect_moved_files(pc_files, phone_files, pc_dir, phone_dir):
                             print(f'Deleted discarded path on phone: {discarded_on_phone}')
                         except OSError as e:
                             print(f'Error deleting {discarded_on_phone}: {e}')
-                    # Add comment to kept file
+                    # Add comment to kept file, preserving original timestamp
                     timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                     comment = f"  {phone_rel}  kept after de-duplication at {timestamp}\n"
                     try:
+                        original_mtime = os.stat(phone_abs).st_mtime
                         with open(phone_abs, 'a') as f:
                             f.write(comment)
+                        os.utime(phone_abs, (original_mtime, original_mtime))
                         print(f'Added de-duplication comment to: {phone_abs}')
                     except OSError as e:
                         print(f'Error adding comment to {phone_abs}: {e}')
@@ -205,19 +209,23 @@ def detect_moved_files(pc_files, phone_files, pc_dir, phone_dir):
                     # Keep phone_rel in phone_files so it gets copied to PC if needed
                 else:
                     print('Keeping both files. Merge will treat them as independent files.')
-                    # Add comments to both files to differentiate them
+                    # Add comments to both files to differentiate them, preserving original timestamps
                     timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                     pc_comment = f"  {pc_rel}  kept after de-duplication at {timestamp}\n"
                     phone_comment = f"  {phone_rel}  kept after de-duplication at {timestamp}\n"
                     try:
+                        original_mtime = os.stat(pc_abs).st_mtime
                         with open(pc_abs, 'a') as f:
                             f.write(pc_comment)
+                        os.utime(pc_abs, (original_mtime, original_mtime))
                         print(f'Added de-duplication comment to PC file: {pc_abs}')
                     except OSError as e:
                         print(f'Error adding comment to {pc_abs}: {e}')
                     try:
+                        original_mtime = os.stat(phone_abs).st_mtime
                         with open(phone_abs, 'a') as f:
                             f.write(phone_comment)
+                        os.utime(phone_abs, (original_mtime, original_mtime))
                         print(f'Added de-duplication comment to Phone file: {phone_abs}')
                     except OSError as e:
                         print(f'Error adding comment to {phone_abs}: {e}')
@@ -246,7 +254,17 @@ def copy_file(source_path, dest_path):
         return False
     ensure_dir(dest_path)
     print(f"Copying {source_path} to {dest_path}")
+    
+    # Preserve the original file's modification and access times
+    source_stat = os.stat(source_path)
+    source_mtime = source_stat.st_mtime
+    source_atime = source_stat.st_atime
+    
     shutil.copy2(source_path, dest_path)
+    
+    # Explicitly set the destination's timestamps to match the source
+    os.utime(dest_path, (source_atime, source_mtime))
+    
     return True
 
 
@@ -443,6 +461,8 @@ def kobo_import(kobo_mount_path, obsidian_vault_path):
 def main():
     PHONE_DIR = Path("/mnt/android/Internal storage/Documents/Martin PKM")
     PC_DIR = Path("/mnt/saphira/home/PKM")
+    PC_DIR = Path("/home/martin/PKM/")
+
     KOBO_MOUNT_PATH = "/mnt/kobo"
 
     print("\n" + "="*60)
