@@ -30,7 +30,7 @@ def rsync_sync(source_dir: Path, destination_dir: Path):
         "rsync",
         "-a",
         "--update",
-        "--itemize-changes",
+        "--inplace",
         "--exclude", ".obsidian/",
         "--exclude", ".trash/",
         "--exclude", ".smart-env/",
@@ -169,7 +169,9 @@ def kobo_import(kobo_mount_path, obsidian_vault_path):
 
 def main():
     PHONE_DIR = Path("/mnt/android/Internal storage/Documents/Martin PKM")
-    PC_DIR = Path("/home/martin/PKM")
+    # PC_DIR = Path("/home/martin/PKM")
+    PC_DIR = Path("/mnt/saphira/home/PKM")
+
     KOBO_MOUNT_PATH = "/mnt/kobo"
 
     print("\n" + "=" * 60)
