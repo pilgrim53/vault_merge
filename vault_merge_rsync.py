@@ -5,6 +5,36 @@ import sqlite3
 import subprocess
 import shutil
 
+ENV_FILE = Path(__file__).resolve().parent / ".env"
+
+
+def load_env_file(env_path: Path = ENV_FILE):
+    """Load environment variables from a .env file."""
+    if not env_path.exists():
+        return
+
+    with env_path.open(encoding="utf-8") as env_file:
+        for line in env_file:
+            raw_line = line.strip()
+            if not raw_line or raw_line.startswith("#"):
+                continue
+            if "=" not in raw_line:
+                continue
+
+            key, value = raw_line.split("=", 1)
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            if key and value and key not in os.environ:
+                os.environ[key] = value
+
+
+def get_env_var(name: str, required: bool = False) -> str:
+    """Return an environment variable, optionally raising if missing."""
+    value = os.environ.get(name)
+    if required and not value:
+        raise EnvironmentError(f"Missing required environment variable: {name}")
+    return value
+
 
 def ensure_rsync_available():
     """Verify rsync is installed and available on PATH."""
@@ -168,11 +198,16 @@ def kobo_import(kobo_mount_path, obsidian_vault_path):
 
 
 def main():
-    PHONE_DIR = Path("/mnt/android/Internal storage/Documents/Martin PKM")
-    # PC_DIR = Path("/home/martin/PKM")
-    PC_DIR = Path("/mnt/saphira/home/PKM")
+    load_env_file()
 
-    KOBO_MOUNT_PATH = "/mnt/kobo"
+    try:
+        phone_dir = Path(get_env_var("PHONE_DIR", required=True))
+        pc_dir = Path(get_env_var("PC_DIR", required=True))
+        kobo_mount_path = get_env_var("KOBO_DIR", required=True)
+    except EnvironmentError as exc:
+        print(f"Error: {exc}")
+        print("Set PHONE_DIR, PC_DIR, and KOBO_DIR in .env or environment variables.")
+        return
 
     print("\n" + "=" * 60)
     print("OBSIDIAN VAULT MERGE & KOBO IMPORT UTILITY")
@@ -186,24 +221,24 @@ def main():
 
     if choice == "1":
         print("\nMerging new/updated files between Phone and PC using rsync...")
-        print("Phone Directory:", PHONE_DIR)
-        print("PC Directory:", PC_DIR)
+        print("Phone Directory:", phone_dir)
+        print("PC Directory:", pc_dir)
         try:
-            merge_directories(PC_DIR, PHONE_DIR)
+            merge_directories(pc_dir, phone_dir)
         except FileNotFoundError as exc:
             print(f"Error: {exc}")
         except subprocess.CalledProcessError as exc:
             print(f"rsync failed with exit code {exc.returncode}")
     elif choice == "2":
-        if not os.path.exists(KOBO_MOUNT_PATH):
-            print(f"\nError: Kobo mount path not found: {KOBO_MOUNT_PATH}")
+        if not os.path.exists(kobo_mount_path):
+            print(f"\nError: Kobo mount path not found: {kobo_mount_path}")
             print("Please mount your Kobo device first.")
             return
 
         print(f"\nImporting Kobo highlights...")
-        print(f"Kobo Mount Path: {KOBO_MOUNT_PATH}")
-        print(f"PC Directory: {PC_DIR}")
-        kobo_import(KOBO_MOUNT_PATH, str(PC_DIR))
+        print(f"Kobo Mount Path: {kobo_mount_path}")
+        print(f"PC Directory: {pc_dir}")
+        kobo_import(kobo_mount_path, str(pc_dir))
     elif choice == "3":
         print("\nExiting...")
         return
