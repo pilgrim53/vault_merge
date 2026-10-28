@@ -1,80 +1,600 @@
-#!/usr/bin/env bash
-# Run directly, or source this file and call pkm_ensure_gdrive.
-# Does not copy, overwrite, or delete any PKM or Google Drive files.
+#!/usr/bin/env python3
+import argparse
+import datetime as dt
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import uuid
+from dataclasses import dataclass
 
-pkm_gdrive_log() {
-    printf '[%s] gdrive: %s\n' "$(date '+%F %T %Z')" "$*" >&2
+VERSION = "2.0.0"
+
+EXCLUDED = {
+    ".obsidian", ".agents", ".claude", ".copilot", ".opencode",
+    ".smart-env", ".git", ".trash",
 }
 
-pkm_gdrive_identity() {
-    findmnt -rn --mountpoint /home/martin/gdrive -o SOURCE,FSTYPE
-}
 
-pkm_gdrive_mount_readable() {
-    local identity
-    identity="$(pkm_gdrive_identity)" || return 1
-    [[ "$identity" =~ ^gdrive:[[:space:]]+fuse\.rclone$ ]] || return 1
-    timeout 20s ls -A -- /home/martin/gdrive/Muse >/dev/null 2>&1
-}
+class SyncError(Exception):
+    pass
 
-pkm_ensure_gdrive() {
-    local tool identity
-    for tool in findmnt timeout ls systemctl rclone date id; do
-        if ! command -v "$tool" >/dev/null 2>&1; then
-            pkm_gdrive_log "Required command not found: $tool"
-            return 1
-        fi
-    done
-    if [[ "$(id -un)" != martin ]]; then
-        pkm_gdrive_log "Run as martin, not with sudo or as another user."
-        return 1
-    fi
 
-    if ! pkm_gdrive_mount_readable; then
-        identity="$(pkm_gdrive_identity 2>/dev/null)" || identity=""
-        if [[ -n "$identity" ]] &&
-           [[ ! "$identity" =~ ^gdrive:[[:space:]]+fuse\.rclone$ ]]; then
-            pkm_gdrive_log "Unexpected filesystem at /home/martin/gdrive: $identity"
-            pkm_gdrive_log "Refusing to replace or unmount it. Sync must stop."
-            return 1
-        fi
-        if [[ ! -d /home/martin/gdrive ]]; then
-            pkm_gdrive_log "Mountpoint missing or inaccessible. Sync must stop."
-            return 1
-        fi
+@dataclass
+class Item:
+    path: Path
+    digest: str
+    size: int
+    mtime: float
 
-        pkm_gdrive_log "Mount missing or unreadable; recovering via rclone-gdrive.service."
-        if ! timeout 15s systemctl --user reset-failed rclone-gdrive.service; then
-            pkm_gdrive_log "Could not clear service failure state. Sync must stop."
-            return 1
-        fi
-        # One bounded recovery attempt. No manual mount, forced unmount,
-        # --allow-non-empty, permission changes, or OAuth reconfiguration.
-        if ! timeout 90s systemctl --user restart rclone-gdrive.service; then
-            pkm_gdrive_log "Service restart failed or timed out. Sync must stop."
-            pkm_gdrive_log "Inspect: journalctl --user -u rclone-gdrive.service -n 40 --no-pager"
-            return 1
-        fi
-        if ! pkm_gdrive_mount_readable; then
-            pkm_gdrive_log "Expected gdrive: mount or readable Muse folder still absent. Sync must stop."
-            return 1
-        fi
-    fi
 
-    # A cached FUSE listing alone does not prove current Google API access.
-    # This read-only check validates the remote without depending on FUSE.
-    pkm_gdrive_log "Mount readable; checking live Google Drive access."
-    if ! timeout 45s rclone lsf gdrive:Muse --max-depth 1 \
-        --contimeout 10s --timeout 20s --retries 1 --low-level-retries 1 \
-        >/dev/null; then
-        pkm_gdrive_log "Live Drive check failed. No imports or phone push should run."
-        pkm_gdrive_log "If the error reports invalid_grant, run: rclone config reconnect gdrive:"
-        return 1
-    fi
-    pkm_gdrive_log "Ready: gdrive:Muse at /home/martin/gdrive/Muse."
-}
+def inspect(path):
+    path = Path(path)
+    if path.is_symlink() or not path.is_file():
+        raise SyncError(f"Not a regular file (or is a symlink): {path}")
+    h = hashlib.sha256()
+    with path.open("rb") as stream:
+        before = os.fstat(stream.fileno())
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            h.update(block)
+        after = os.fstat(stream.fileno())
+    if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
+        raise SyncError(f"File changed while reading: {path}")
+    return Item(path, h.hexdigest(), after.st_size, after.st_mtime)
 
-if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
-    pkm_ensure_gdrive
-    exit "$?"
-fi
+
+def scan(root, exclusions=False):
+    if not root.is_dir() or root.is_symlink():
+        raise SyncError(f"Directory missing, inaccessible, or symlinked: {root}")
+    files, directories = {}, set()
+
+    def walk_error(error):
+        raise SyncError(f"Cannot enumerate source: {error}")
+
+    for base, dirs, names in os.walk(root, onerror=walk_error, followlinks=False):
+        base = Path(base)
+        if exclusions and base == root:
+            dirs[:] = [d for d in dirs if d not in EXCLUDED]
+            names = [n for n in names if n not in EXCLUDED]
+        for name in dirs:
+            path = base / name
+            if path.is_symlink():
+                raise SyncError(f"Symlinked directory not supported: {path}")
+            directories.add(path.relative_to(root).as_posix())
+        for name in names:
+            path = base / name
+            files[path.relative_to(root).as_posix()] = inspect(path)
+    return files, directories
+
+
+def assert_unchanged(path, expected):
+    if expected is None:
+        if path.exists() or path.is_symlink():
+            raise SyncError(f"Unexpected new destination: {path}")
+    elif inspect(path).digest != expected.digest:
+        raise SyncError(f"File changed since preview: {path}")
+
+
+def copy_checked(source, destination, expected_hash, timestamp_required=False):
+    """Write a sibling temporary file, verify it, then rename into place."""
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temp = destination.with_name(".pkm-transfer-" + uuid.uuid4().hex)
+    try:
+        # Exclusive create: never overwrite an unrelated temporary file.
+        with source.open("rb") as src, temp.open("xb") as dst:
+            h = hashlib.sha256()
+            for block in iter(lambda: src.read(1024 * 1024), b""):
+                dst.write(block)
+                h.update(block)
+        if h.hexdigest() != expected_hash or inspect(temp).digest != expected_hash:
+            raise SyncError(f"Transfer verification failed: {source} -> {destination}")
+        try:
+            stamp = source.stat().st_mtime
+            os.utime(temp, (stamp, stamp))
+        except OSError:
+            if timestamp_required:
+                raise
+            # MTP may not support setting timestamps. Content verification is mandatory.
+            print(f"NOTICE: timestamp not preserved: {destination}", flush=True)
+        os.replace(temp, destination)
+    finally:
+        if temp.exists():
+            temp.unlink()
+
+
+def copy_phone_checked(source, destination, expected_hash):
+    """No MTP rename: verified local source -> final phone path -> read-back."""
+    if inspect(source).digest != expected_hash:
+        raise SyncError(f"Outbound source changed: {source}")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    # Caller must have saved the old content AND an in-flight checkpoint first.
+    # This deliberately is not atomic. A failed copy stays resumable.
+    with source.open("rb") as src, destination.open("wb") as dst:
+        h = hashlib.sha256()
+        for block in iter(lambda: src.read(1024 * 1024), b""):
+            dst.write(block)
+            h.update(block)
+    if h.hexdigest() != expected_hash or inspect(destination).digest != expected_hash:
+        raise SyncError(f"Phone transfer verification failed: {destination}")
+    try:
+        stamp = source.stat().st_mtime
+        os.utime(destination, (stamp, stamp))
+    except OSError:
+        print(f"NOTICE: timestamp not preserved: {destination}", flush=True)
+
+
+def write_json_atomic(path, value):
+    temp = path.with_name(path.name + "-" + uuid.uuid4().hex + ".tmp")
+    try:
+        with temp.open("x") as stream:
+            json.dump(value, stream, indent=2)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temp, path)
+        # Persist the rename as well as file content on the local state disk.
+        fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    finally:
+        if temp.exists():
+            temp.unlink()
+
+
+def pack_item(item):
+    return None if item is None else {
+        "path": str(item.path), "digest": item.digest, "size": item.size, "mtime": item.mtime,
+    }
+
+
+def unpack_item(value):
+    return None if value is None else Item(
+        Path(value["path"]), value["digest"], value["size"], value["mtime"],
+    )
+
+
+def diagnostics():
+    print("Resource diagnostics (no limits changed):")
+    pids = {os.getpid()}
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            if (entry / "comm").read_text().strip() in {"jmtpfs", "mtpfs"}:
+                pids.add(int(entry.name))
+        except OSError:
+            pass
+    for pid in sorted(pids):
+        try:
+            root = Path("/proc") / str(pid)
+            # Explicitly close the directory iterator before continuing.
+            with os.scandir(root / "fd") as entries:
+                count = sum(1 for _ in entries)
+            limits = next(
+                line for line in (root / "limits").read_text().splitlines()
+                if line.startswith("Max open files")
+            )
+            print(f"  PID {pid} {(root / 'comm').read_text().strip()}: "
+                  f"FDs={count}; {limits}")
+        except (OSError, StopIteration):
+            print(f"  PID {pid}: cannot inspect descriptors/limits")
+
+
+class Job:
+    def __init__(self, master, phone, muse, state, initial=False, mirror=False):
+        self.master, self.phone, self.muse = map(Path, (master, phone, muse))
+        self.state_path = Path(state)
+        self.initial, self.mirror = initial, mirror
+        self.state = (
+            json.loads(self.state_path.read_text())
+            if self.state_path.exists()
+            else {"initialized": False, "receipts": {}}
+        )
+        if not initial and not self.state.get("initialized"):
+            raise SyncError("First run must use --initial; no phone pull is permitted yet.")
+        if initial and self.state.get("initialized"):
+            raise SyncError("Initial deployment already succeeded. Omit --initial to collect phone updates.")
+        self.imports, self.pushes, self.deletes = [], [], []
+        self.messages = []
+
+    def receipt(self, source, rel, digest):
+        key = source + ":" + rel
+        values = self.state["receipts"].setdefault(key, [])
+        if digest not in values:
+            values.append(digest)
+
+    def collect(self, source, root, prefix, desired):
+        files, directories = scan(root)
+        for rel, item in sorted(files.items()):
+            key = source + ":" + rel
+            target = prefix + "/" + rel
+            current = desired.get(target)
+            # Already incorporated content must not resurrect a moved/deleted note.
+            if item.digest in self.state["receipts"].get(key, []):
+                continue
+            if current and current.digest == item.digest:
+                self.receipt(source, rel, item.digest)
+                continue
+            if current:
+                delta = item.mtime - current.mtime
+                # MTP timestamp resolution/semantics vary. Never guess on a tie.
+                if abs(delta) <= 2:
+                    raise SyncError(
+                        f"Different content with ambiguous timestamps: {item.path} "
+                        f"and {self.master / target}. Resolve manually before syncing."
+                    )
+                if delta < 0:
+                    self.messages.append(f"KEEP newer master: {target}")
+                    # Remember this deliberately rejected source version too, so
+                    # moving the newer master later cannot resurrect the old copy.
+                    self.receipt(source, rel, item.digest)
+                    continue
+            self.imports.append((target, item, current))
+            desired[target] = item
+            self.receipt(source, rel, item.digest)
+        # Do not recreate directories of receipted files moved by the user.
+        for target, _, _ in self.imports:
+            parent = Path(target).parent
+            while parent != Path("."):
+                self.desired_dirs.add(parent.as_posix())
+                parent = parent.parent
+
+    def plan(self):
+        self.master_files, self.desired_dirs = scan(self.master, exclusions=True)
+        desired = dict(self.master_files)
+        self.phone_files, self.phone_dirs = scan(self.phone, exclusions=True)
+        if not self.initial:
+            self.collect(
+                "phone", self.phone / "External/Journal",
+                "External/Journal", desired,
+            )
+        self.collect("drive", self.muse, "External/Google_Drive", desired)
+        for path in self.desired_dirs:
+            if path in self.phone_files:
+                raise SyncError(f"Phone file blocks required directory: {path}")
+        for rel, item in sorted(desired.items()):
+            if rel in self.phone_dirs:
+                raise SyncError(f"Phone directory blocks required file: {rel}")
+            old = self.phone_files.get(rel)
+            if old is None or old.digest != item.digest:
+                self.pushes.append((rel, item, old))
+        if self.mirror:
+            self.deletes = sorted(set(self.phone_files) - set(desired))
+        self.desired = desired
+        self.remove_dirs = (
+            sorted(self.phone_dirs - self.desired_dirs, key=lambda s: (-s.count("/"), s))
+            if self.mirror else []
+        )
+
+    def display(self):
+        print("MODE:", "INITIAL (no phone import)" if self.initial else "REGULAR")
+        print("MASTER:", self.master)
+        print("PHONE:", self.phone)
+        print(f"Included files: master={len(self.master_files)}, phone={len(self.phone_files)}")
+        for message in self.messages:
+            print(message)
+        for rel, _, old in self.imports:
+            print("IMPORT " + ("UPDATE " if old else "ADD ") + rel)
+        for rel, _, old in self.pushes:
+            print("PHONE " + ("REPLACE " if old else "ADD ") + rel)
+        for rel in self.deletes:
+            print("PHONE DELETE " + rel)
+        for rel in self.remove_dirs:
+            print("PHONE REMOVE DIRECTORY IF EMPTY " + rel)
+        print(
+            f"Summary: {len(self.imports)} imports, {len(self.pushes)} phone writes, "
+            f"{len(self.deletes)} phone file deletions."
+        )
+        print("Preserved/excluded top-level folders:", ", ".join(sorted(EXCLUDED)))
+
+    def save_plan(self):
+        value = {
+            "schema": 1, "master": str(self.master), "phone": str(self.phone),
+            "muse": str(self.muse), "state_path": str(self.state_path),
+            "initial": self.initial, "mirror": self.mirror, "state": self.state,
+            "master_files": {k: pack_item(v) for k, v in self.master_files.items()},
+            "phone_files": {k: pack_item(v) for k, v in self.phone_files.items()},
+            "desired": {k: pack_item(v) for k, v in self.desired.items()},
+            "desired_dirs": sorted(self.desired_dirs), "phone_dirs": sorted(self.phone_dirs),
+            "imports": [[r, pack_item(i), pack_item(o)] for r, i, o in self.imports],
+            "pushes": [[r, pack_item(i), pack_item(o)] for r, i, o in self.pushes],
+            "deletes": self.deletes, "remove_dirs": self.remove_dirs,
+            "messages": self.messages,
+        }
+        write_json_atomic(self.backup / "plan.json", value)
+
+    @classmethod
+    def resume(cls, state_path):
+        progress_path = Path(state_path).parent / "active-run.json"
+        progress = json.loads(progress_path.read_text())
+        backup = Path(progress["backup"])
+        value = json.loads((backup / "plan.json").read_text())
+        if value.get("schema") != 1:
+            raise SyncError("Unsupported checkpoint schema.")
+        self = cls.__new__(cls)
+        for name in ("master", "phone", "muse", "state_path"):
+            setattr(self, name, Path(value[name]))
+        if self.state_path != Path(state_path):
+            raise SyncError("Checkpoint state path mismatch.")
+        for name in ("initial", "mirror", "state", "deletes", "remove_dirs", "messages"):
+            setattr(self, name, value[name])
+        for name in ("master_files", "phone_files", "desired"):
+            setattr(self, name, {k: unpack_item(v) for k, v in value[name].items()})
+        for name in ("desired_dirs", "phone_dirs"):
+            setattr(self, name, set(value[name]))
+        for name in ("imports", "pushes"):
+            setattr(self, name, [(r, unpack_item(i), unpack_item(o))
+                                for r, i, o in value[name]])
+        self.backup, self.progress = backup, progress
+        self.journal = backup / "operations.jsonl"
+        return self
+
+    def checkpoint(self):
+        write_json_atomic(self.state_path.parent / "active-run.json", self.progress)
+
+    def start_run(self):
+        active = self.state_path.parent / "active-run.json"
+        if active.exists():
+            raise SyncError("An unfinished run exists. Use --resume, not a new run.")
+        run = dt.datetime.now().astimezone().strftime("%Y%m%dT%H%M%S%z") + "-" + uuid.uuid4().hex[:8]
+        self.backup = self.state_path.parent / "backups" / run
+        self.backup.mkdir(parents=True, exist_ok=False)
+        self.journal = self.backup / "operations.jsonl"
+        self.save_plan()
+        self.progress = {
+            "backup": str(self.backup), "run": run, "phase": "imports", "index": 0,
+            "inflight": False,
+        }
+        self.checkpoint()
+
+    def begin_operation(self, device, rel, action, old, destination):
+        if self.progress["inflight"]:
+            # Only a previously checkpointed operation may bypass the original
+            # destination checksum. It may contain a partial direct MTP write.
+            # Old content must still exist in the original verified backup.
+            if old:
+                saved = self.backup / device / rel
+                if not saved.is_file() or inspect(saved).digest != old.digest:
+                    raise SyncError(f"Missing/invalid original backup: {saved}")
+            self.record("retry", device, rel, action)
+            return
+        assert_unchanged(destination, old)
+        if old:
+            self.save_backup(device, rel, old)
+        self.record("intent", device, rel, action)
+        self.progress["inflight"] = True
+        self.checkpoint()
+
+    def end_operation(self, device, rel, action):
+        self.record("done", device, rel, action)
+        self.progress["index"] += 1
+        self.progress["inflight"] = False
+        self.checkpoint()
+
+    def next_phase(self, name):
+        self.progress.update(phase=name, index=0, inflight=False)
+        self.checkpoint()
+
+    def apply(self, batch_size=None):
+        if batch_size is not None and batch_size < 1:
+            raise SyncError("Batch size must be positive.")
+        if not hasattr(self, "progress"):
+            # Check before opening an active run, so a preflight mismatch can be
+            # corrected and freshly previewed without a resumable mutation.
+            self.validate_new_plan()
+            self.start_run()
+        budget = batch_size
+        used = 0
+
+        def pause_if_needed():
+            if budget is not None and used >= budget:
+                print(f"PAUSED after {used} phone operations; cursor saved: "
+                      f"{self.progress['phase']}[{self.progress['index']}]", flush=True)
+                print("Keep phone and master inactive. Continue: pkm-sync --resume --apply")
+                diagnostics()
+                return True
+            return False
+
+        if self.progress["phase"] == "imports":
+            while self.progress["index"] < len(self.imports):
+                rel, item, old = self.imports[self.progress["index"]]
+                destination = self.master / rel
+                assert_unchanged(item.path, item)
+                self.begin_operation("master", rel, "replace" if old else "create", old, destination)
+                copy_checked(item.path, destination, item.digest, timestamp_required=True)
+                self.end_operation("master", rel, "replace" if old else "create")
+            self.next_phase("pushes")
+
+        if self.progress["phase"] in {"pushes", "deletes", "directories", "verify"}:
+            # All imports must have succeeded. Verify local sources every batch,
+            # but don't re-read every phone file or open a new transport session.
+            for rel, item in self.desired.items():
+                assert_unchanged(self.master / rel, item)
+
+        if self.progress["phase"] == "pushes":
+            for rel in sorted(self.desired_dirs, key=lambda s: (s.count("/"), s)):
+                (self.phone / rel).mkdir(parents=True, exist_ok=True)
+            while self.progress["index"] < len(self.pushes):
+                if pause_if_needed():
+                    return False
+                rel, item, old = self.pushes[self.progress["index"]]
+                destination = self.phone / rel
+                self.begin_operation("phone", rel, "replace" if old else "create", old, destination)
+                copy_phone_checked(self.master / rel, destination, item.digest)
+                self.end_operation("phone", rel, "replace" if old else "create")
+                used += 1
+                print(f"PHONE WRITE {self.progress['index']}/{len(self.pushes)}: {rel}", flush=True)
+            self.next_phase("deletes")
+
+        if self.progress["phase"] == "deletes":
+            while self.progress["index"] < len(self.deletes):
+                if pause_if_needed():
+                    return False
+                rel = self.deletes[self.progress["index"]]
+                old = self.phone_files[rel]
+                destination = self.phone / rel
+                self.begin_operation("phone", rel, "delete", old, destination)
+                if destination.exists():
+                    destination.unlink()
+                self.end_operation("phone", rel, "delete")
+                used += 1
+                print(f"PHONE DELETE {self.progress['index']}/{len(self.deletes)}: {rel}", flush=True)
+            self.next_phase("directories")
+
+        if self.progress["phase"] == "directories":
+            while self.progress["index"] < len(self.remove_dirs):
+                if pause_if_needed():
+                    return False
+                rel = self.remove_dirs[self.progress["index"]]
+                directory = self.phone / rel
+                if directory.is_dir():
+                    # Explicitly close even when the directory is nonempty.
+                    with os.scandir(directory) as entries:
+                        empty = next(entries, None) is None
+                    if empty:
+                        directory.rmdir()
+                self.progress["index"] += 1
+                self.checkpoint()
+                used += 1
+            self.next_phase("verify")
+
+        if self.progress["phase"] == "verify":
+            desired_list = sorted(self.desired.items())
+            while self.progress["index"] < len(desired_list):
+                if pause_if_needed():
+                    return False
+                rel, item = desired_list[self.progress["index"]]
+                if inspect(self.phone / rel).digest != item.digest:
+                    raise SyncError(f"Final phone verification failed: {rel}")
+                self.progress["index"] += 1
+                self.checkpoint()
+                used += 1
+            # Build receipts even for entries verified in an earlier batch.
+            for rel, item in desired_list:
+                if rel.startswith("External/Journal/"):
+                    self.receipt("phone", rel[len("External/Journal/"):], item.digest)
+            self.state["initialized"] = True
+            self.state["last_success"] = self.progress["run"]
+            write_json_atomic(self.state_path, self.state)
+            self.next_phase("complete")
+
+        if self.progress["phase"] == "complete":
+            (self.state_path.parent / "active-run.json").unlink()
+            print("SUCCESS. Changed/deleted originals and operation log:", self.backup)
+            return True
+        raise SyncError(f"Unknown cursor phase: {self.progress['phase']}")
+
+    def validate_new_plan(self):
+        # Validate the whole plan before any content mutation.
+        for rel, item in self.master_files.items():
+            assert_unchanged(self.master / rel, item)
+        for rel, item in self.phone_files.items():
+            assert_unchanged(self.phone / rel, item)
+        for _, item, _ in self.imports:
+            assert_unchanged(item.path, item)
+
+    def record(self, phase, device, rel, action):
+        with self.journal.open("a") as stream:
+            stream.write(json.dumps({
+                "phase": phase, "device": device, "path": rel, "action": action,
+            }) + "\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+
+    def save_backup(self, device, rel, item):
+        copy_checked(item.path, self.backup / device / rel, item.digest)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
+    parser.add_argument("--initial", action="store_true", help="Skip phone imports.")
+    parser.add_argument("--mirror", action="store_true", help="Remove obsolete INCLUDED phone files.")
+    parser.add_argument("--apply", action="store_true", help="Apply after interactive confirmation.")
+    parser.add_argument("--resume", action="store_true", help="Use the saved unfinished plan/cursor.")
+    parser.add_argument("--batch-size", type=int, default=500,
+                        help="Maximum phone file/directory/check operations per invocation (default 500).")
+    parser.add_argument("--diagnose", action="store_true", help="Show Python/jmtpfs FD counts and limits only.")
+    args = parser.parse_args()
+    if args.diagnose:
+        diagnostics()
+        return
+    if args.batch_size < 1:
+        parser.error("--batch-size must be positive")
+    if args.resume and (args.initial or args.mirror):
+        parser.error("--resume uses the saved flags; omit --initial and --mirror")
+    if os.getuid() == 0 or Path.home() != Path("/home/martin"):
+        raise SyncError("Run as martin on the laptop, not with sudo.")
+    home = Path.home()
+    state_dir = home / ".local/state/pkm-sync"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    os.chmod(state_dir, 0o700)
+    with (state_dir / "lock").open("a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise SyncError("Another PKM sync is running.")
+        subprocess.run([str(home / ".local/bin/pkm-gdrive-guard.sh")], check=True)
+        mount = subprocess.run(
+            ["findmnt", "-rn", "--mountpoint", "/mnt/android", "-o", "FSTYPE"],
+            text=True, capture_output=True, check=True,
+        ).stdout.strip()
+        if mount not in {"fuse.jmtpfs", "fuse.mtpfs"}:
+            raise SyncError(f"Expected jmtpfs/mtpfs at /mnt/android; found: {mount!r}")
+        for required in ("External/Journal", "External/Google_Drive", ".obsidian"):
+            if not (home / "PKM" / required).is_dir():
+                raise SyncError(f"Expected master-vault directory missing: {home / 'PKM' / required}")
+        state_path = state_dir / "state.json"
+        if args.resume:
+            job = Job.resume(state_path)
+            print(f"RESUME: {job.progress['phase']}[{job.progress['index']}]; "
+                  f"in-flight operation={job.progress['inflight']}")
+            print(f"Saved plan: {job.backup / 'plan.json'}")
+            print(f"Original plan: {len(job.pushes)} phone writes, {len(job.deletes)} deletions.")
+        else:
+            if (state_dir / "active-run.json").exists():
+                raise SyncError("Unfinished run exists. Use --resume; do not start a new plan.")
+            job = Job(
+                home / "PKM",
+                "/mnt/android/Internal storage/Documents/Martin PKM",
+                home / "gdrive/Muse",
+                state_path,
+                initial=args.initial, mirror=args.mirror,
+            )
+            print("Reading and hashing files. MTP can be slow; no content writes yet.", flush=True)
+            job.plan()
+            job.display()
+        if not args.apply:
+            print("PREVIEW ONLY. No vault or phone content changed.")
+            print("The Drive guard may have mounted/recovered Drive; local lock directory was created.")
+            return
+        if not sys.stdin.isatty():
+            raise SyncError("--apply requires an interactive terminal.")
+        phrase = "MIRROR PHONE" if job.mirror else "APPLY"
+        print("Keep the phone inactive and close Obsidian/editors/agents on the laptop.")
+        print("Replaced/deleted file contents will be backed up locally before mutation.")
+        if input(f"Type {phrase!r} to proceed: ") != phrase:
+            raise SyncError("Cancelled; no content changes applied.")
+        job.apply(batch_size=args.batch_size)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (SyncError, OSError, ValueError, subprocess.SubprocessError) as error:
+        print(f"STOPPED: {error}", file=sys.stderr)
+        print("Do not resume phone editing if an apply was interrupted; inspect backups/log first.",
+              file=sys.stderr)
+        if isinstance(error, OSError) and error.errno in {23, 24}:
+            print("Descriptor exhaustion may be inside jmtpfs. Remount it before resuming.",
+                  file=sys.stderr)
+            try:
+                diagnostics()
+            except OSError:
+                pass
+        sys.exit(1)
