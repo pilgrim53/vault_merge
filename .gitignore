@@ -1,2 +1,103 @@
-.env
+# Python bytecode, environments, packaging, and test output
 __pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+build/
+dist/
+*.egg-info/
+
+# Editor and OS artifacts
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Private environment/configuration overrides
+.env
+.env.*
+!.env.example
+!.env.sample
+/.envrc
+/config.local.*
+/pkm-sync.local.*
+/private/
+/local/
+/secrets/
+/credentials/
+/.config/
+
+# OAuth/rclone credentials, tokens, and private key material
+rclone.conf
+rclone.conf.*
+client_secret*.json
+client-secret*.json
+credentials.json
+credentials-*.json
+service-account*.json
+service_account*.json
+token.json
+tokens.json
+oauth-token*.json
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa
+id_rsa.*
+id_ed25519
+id_ed25519.*
+
+# Runtime data is normally outside the repo. Ignore accidental copies too.
+/.local/
+/state/
+/runtime/
+/backups/
+/logs/
+/terminal-transcripts/
+state.json
+active-run.json
+plan.json
+operations.jsonl
+*.log
+*.log.*
+*.pid
+*.lock
+.pkm-transfer-*
+state-*.tmp
+state.json-*.tmp
+active-run.json-*.tmp
+plan.json-*.tmp
+
+# Accidental vault, mount-content, and application-state copies
+/PKM/
+/pkm-vault/
+/vault/
+/vaults/
+/gdrive/
+/android/
+.obsidian/
+.smart-env/
+.opencode/
+.agents/
+.claude/
+.copilot/
+.trash/
+
+# Do not add blanket *.md / *.json / *.sh rules:
+# source, documentation, and sanitized example files should remain trackable.
+# This file does not remove already-tracked files or sanitize Git history.
