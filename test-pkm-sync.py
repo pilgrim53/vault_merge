@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Local mock filesystem tests. Does not access the user's phone or Drive."""
 import importlib.util
+import contextlib
+import io
 import json
 import os
 from pathlib import Path
@@ -435,6 +437,35 @@ class Tests(unittest.TestCase):
             job.apply()
         self.assertFalse((self.phone / "new.md").exists())
         self.assertFalse((self.state.parent / "active-run.json").exists())
+
+    def test_resume_display_reports_only_pending_operations(self):
+        self.write(self.master, "a.md", "a")
+        self.write(self.master, "b.md", "b")
+        self.write(self.phone, "old.md", "old")
+        job = self.job()
+        job.progress = {"phase": "pushes", "index": 1, "inflight": False}
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            job.display()
+        text = output.getvalue()
+        self.assertIn("MODE: RESUME INITIAL", text)
+        self.assertIn("Remaining: 0 imports, 1 phone writes, 1 phone file deletions.", text)
+        self.assertNotIn("PHONE ADD a.md", text)
+        self.assertIn("PHONE ADD b.md", text)
+
+    def test_verification_cursor_never_lists_completed_deletions(self):
+        self.write(self.master, "a.md", "a")
+        self.write(self.master, "b.md", "b")
+        self.write(self.phone, "old.md", "old")
+        job = self.job()
+        job.progress = {"phase": "verify", "index": 1, "inflight": False}
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            job.display()
+        text = output.getvalue()
+        self.assertIn("Remaining: 0 imports, 0 phone writes, 0 phone file deletions.", text)
+        self.assertIn("1 verification reads", text)
+        self.assertNotIn("PHONE DELETE old.md", text)
 
 
 if __name__ == "__main__":

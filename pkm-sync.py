@@ -16,7 +16,7 @@ import tempfile
 import uuid
 from dataclasses import dataclass
 
-VERSION = "2.2.0"
+VERSION = "2.2.1"
 
 EXCLUDED = {
     ".obsidian", ".agents", ".claude", ".copilot", ".opencode",
@@ -43,7 +43,8 @@ def confirm_gui(job):
     if hasattr(job, "progress"):
         text.write(
             f"Resume saved run at {job.progress['phase']}[{job.progress['index']}].\n"
-            "The list below is the ORIGINAL plan; completed work will not be repeated.\n\n"
+            "Only pending operations are listed below. Completed work will not be repeated.\n"
+            "This is a saved plan, not a fresh scan for new changes.\n\n"
         )
     text.write(
         "Keep the phone inactive and stop laptop vault editors/agents until SUCCESS.\n"
@@ -354,24 +355,49 @@ class Job:
         )
 
     def display(self):
-        print("MODE:", "INITIAL (no phone import)" if self.initial else "REGULAR")
+        resumable = hasattr(self, "progress")
+        mode = "INITIAL (no phone import)" if self.initial else "REGULAR"
+        print("MODE:", ("RESUME " if resumable else "") + mode)
         print("MASTER:", self.master)
         print("PHONE:", self.phone)
-        print(f"Included files: master={len(self.master_files)}, phone={len(self.phone_files)}")
+        label = "Saved snapshot (not a live scan)" if resumable else "Included files"
+        print(f"{label}: master={len(self.master_files)}, phone={len(self.phone_files)}")
+        imports, pushes, deletes = self.imports, self.pushes, self.deletes
+        directories = self.remove_dirs
+        verification = len(self.desired)
+        if resumable:
+            phases = ["imports", "pushes", "deletes", "directories", "verify", "complete"]
+            phase, index = self.progress["phase"], self.progress["index"]
+            if phase not in phases or index < 0:
+                raise SyncError("Invalid saved cursor.")
+            current = phases.index(phase)
+            def pending(items, name):
+                position = phases.index(name)
+                return [] if current > position else items[index:] if current == position else items
+            imports = pending(imports, "imports")
+            pushes = pending(pushes, "pushes")
+            deletes = pending(deletes, "deletes")
+            directories = pending(directories, "directories")
+            verification = len(pending(list(self.desired), "verify"))
+            print(f"CURSOR: {phase}[{index}]; in-flight={self.progress['inflight']}")
+            print("This is unfinished saved work, not a new initial deployment.")
         for message in self.messages:
             print(message)
-        for rel, _, old in self.imports:
+        for rel, _, old in imports:
             print("IMPORT " + ("UPDATE " if old else "ADD ") + rel)
-        for rel, _, old in self.pushes:
+        for rel, _, old in pushes:
             print("PHONE " + ("REPLACE " if old else "ADD ") + rel)
-        for rel in self.deletes:
+        for rel in deletes:
             print("PHONE DELETE " + rel)
-        for rel in self.remove_dirs:
+        for rel in directories:
             print("PHONE REMOVE DIRECTORY IF EMPTY " + rel)
+        prefix = "Remaining" if resumable else "Summary"
         print(
-            f"Summary: {len(self.imports)} imports, {len(self.pushes)} phone writes, "
-            f"{len(self.deletes)} phone file deletions."
+            f"{prefix}: {len(imports)} imports, {len(pushes)} phone writes, "
+            f"{len(deletes)} phone file deletions."
         )
+        if resumable:
+            print(f"Also pending: {len(directories)} directory checks, {verification} verification reads.")
         print("Preserved/excluded top-level folders:", ", ".join(sorted(EXCLUDED)))
 
     def save_plan(self):
@@ -665,7 +691,7 @@ def main():
             print(f"RESUME: {job.progress['phase']}[{job.progress['index']}]; "
                   f"in-flight operation={job.progress['inflight']}")
             print(f"Saved plan: {job.backup / 'plan.json'}")
-            print(f"Original plan: {len(job.pushes)} phone writes, {len(job.deletes)} deletions.")
+            job.display()
         else:
             if (state_dir / "active-run.json").exists():
                 raise SyncError("Unfinished run exists. Use --resume; do not start a new plan.")

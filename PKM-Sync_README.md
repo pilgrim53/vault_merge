@@ -2,7 +2,7 @@
 
 A preview-first, laptop-master synchronization tool for an Obsidian vault, an Android journal, and a Google Drive intake folder. Collect external updates into the laptop vault, then return the aggregated content to the phone.
 
-This is a controlled **collect-then-push workflow**, not unrestricted bidirectional sync. Version 2.2.0 asks for approval once, then continues sequentially through all batches and final verification. An optional XFCE/Zenity desktop watcher offers a reviewed sync when the phone is mounted.
+This is a controlled **collect-then-push workflow**, not unrestricted bidirectional sync. Version 2.2.1 asks for approval once, then continues sequentially through all batches and final verification. An optional XFCE/Zenity desktop watcher offers a reviewed sync when the phone is mounted.
 
 ## Workflow
 
@@ -196,6 +196,8 @@ Do not combine `--resume` with `--initial`, `--mirror`, or `--phone-vault`: the 
 
 `CHECKPOINT` is progress, not completion. `PAUSED` is only expected with optional manual mode. Wait for **`SUCCESS`** before resuming editing or unmounting the phone.
 
+Resume displays are labeled `RESUME INITIAL` or `RESUME REGULAR`. File counts are the saved snapshot, not a fresh scan. The operation list and `Remaining` summary show only work at or after the cursor. A verification-only cursor therefore shows zero remaining imports/writes/deletions and the outstanding verification-read count.
+
 ### Optional controls
 
 ```bash
@@ -339,7 +341,7 @@ Run the mock-filesystem tests from the repository root:
 python3 test-pkm-sync.py
 ```
 
-Version 2.2.0 has 43 tests covering collection, exclusions, backup preservation, partial-operation recovery, automatic continuation, cursors, phone-path discovery, mount-disconnect guards, GUI approval/cancellation, and watcher behavior. Mock tests do not establish compatibility with every physical device, MTP implementation, or graphical session.
+Version 2.2.1 has 45 tests covering collection, exclusions, backup preservation, partial-operation recovery, automatic continuation, cursors, pending-only resume displays, phone-path discovery, mount-disconnect guards, GUI approval/cancellation, and watcher behavior. Mock tests do not establish compatibility with every physical device, MTP implementation, or graphical session.
 
 ## Public repository hygiene
 
