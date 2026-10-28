@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+"""PKM collect-then-push job. Preview by default; standard library only."""
 import argparse
 import datetime as dt
 import fcntl
@@ -11,7 +12,7 @@ import sys
 import uuid
 from dataclasses import dataclass
 
-VERSION = "2.0.0"
+VERSION = "2.1.1"
 
 EXCLUDED = {
     ".obsidian", ".agents", ".claude", ".copilot", ".opencode",
@@ -183,6 +184,27 @@ def diagnostics():
                   f"FDs={count}; {limits}")
         except (OSError, StopIteration):
             print(f"  PID {pid}: cannot inspect descriptors/limits")
+
+
+def resolve_phone_vault(explicit=None, documents=Path("/mnt/android/Internal storage/Documents")):
+    """Use a private override, or discover exactly one Obsidian vault."""
+    if explicit:
+        path = Path(explicit).expanduser()
+        if not path.is_absolute():
+            raise SyncError("--phone-vault must be an absolute mounted path.")
+        return path
+    if not documents.is_dir():
+        raise SyncError("Phone Documents folder not found. Supply --phone-vault.")
+    candidates = sorted(
+        path for path in documents.iterdir()
+        if path.is_dir() and not path.is_symlink() and (path / ".obsidian").is_dir()
+    )
+    if len(candidates) != 1:
+        raise SyncError(
+            f"Found {len(candidates)} Obsidian vaults in phone Documents; "
+            "choose one with --phone-vault or PKM_PHONE_VAULT."
+        )
+    return candidates[0]
 
 
 class Job:
@@ -380,7 +402,7 @@ class Job:
         self.progress.update(phase=name, index=0, inflight=False)
         self.checkpoint()
 
-    def apply(self, batch_size=None):
+    def apply(self, batch_size=None, pause_after_batch=False):
         if batch_size is not None and batch_size < 1:
             raise SyncError("Batch size must be positive.")
         if not hasattr(self, "progress"):
@@ -392,12 +414,18 @@ class Job:
         used = 0
 
         def pause_if_needed():
+            nonlocal used
             if budget is not None and used >= budget:
-                print(f"PAUSED after {used} phone operations; cursor saved: "
+                label = "PAUSED" if pause_after_batch else "CHECKPOINT"
+                print(f"{label} after {used} phone operations; cursor saved: "
                       f"{self.progress['phase']}[{self.progress['index']}]", flush=True)
-                print("Keep phone and master inactive. Continue: pkm-sync --resume --apply")
-                diagnostics()
-                return True
+                if pause_after_batch:
+                    print("Keep phone and master inactive. Continue: pkm-sync --resume --apply")
+                    diagnostics()
+                    return True
+                # No new prompt or worker process: continue sequentially with
+                # the already approved immutable plan and durable cursor.
+                used = 0
             return False
 
         if self.progress["phase"] == "imports":
@@ -518,18 +546,22 @@ def main():
     parser.add_argument("--apply", action="store_true", help="Apply after interactive confirmation.")
     parser.add_argument("--resume", action="store_true", help="Use the saved unfinished plan/cursor.")
     parser.add_argument("--batch-size", type=int, default=500,
-                        help="Maximum phone file/directory/check operations per invocation (default 500).")
+                        help="Phone operations per progress batch; continues automatically (default 500).")
+    parser.add_argument("--pause-after-batch", action="store_true",
+                        help="Optional manual mode: stop after one batch with a saved cursor.")
     parser.add_argument("--diagnose", action="store_true", help="Show Python/jmtpfs FD counts and limits only.")
+    parser.add_argument("--phone-vault", default=None,
+                        help="Mounted phone vault path; otherwise use PKM_PHONE_VAULT or unique-vault discovery.")
     args = parser.parse_args()
     if args.diagnose:
         diagnostics()
         return
     if args.batch_size < 1:
         parser.error("--batch-size must be positive")
-    if args.resume and (args.initial or args.mirror):
-        parser.error("--resume uses the saved flags; omit --initial and --mirror")
-    if os.getuid() == 0 or Path.home() != Path("/home/martin"):
-        raise SyncError("Run as martin on the laptop, not with sudo.")
+    if args.resume and (args.initial or args.mirror or args.phone_vault):
+        parser.error("--resume uses the saved flags/path; omit --initial, --mirror and --phone-vault")
+    if os.getuid() == 0:
+        raise SyncError("Run as your normal laptop user, not with sudo.")
     home = Path.home()
     state_dir = home / ".local/state/pkm-sync"
     state_dir.mkdir(parents=True, exist_ok=True)
@@ -561,11 +593,15 @@ def main():
                 raise SyncError("Unfinished run exists. Use --resume; do not start a new plan.")
             job = Job(
                 home / "PKM",
-                "/mnt/android/Internal storage/Documents/Martin PKM",
+                resolve_phone_vault(args.phone_vault or os.environ.get("PKM_PHONE_VAULT")),
                 home / "gdrive/Muse",
                 state_path,
                 initial=args.initial, mirror=args.mirror,
             )
+            phone_root = Path("/mnt/android").resolve()
+            phone_target = job.phone.resolve()
+            if phone_target == phone_root or not phone_target.is_relative_to(phone_root):
+                raise SyncError("Phone vault must be a directory below /mnt/android.")
             print("Reading and hashing files. MTP can be slow; no content writes yet.", flush=True)
             job.plan()
             job.display()
@@ -580,7 +616,7 @@ def main():
         print("Replaced/deleted file contents will be backed up locally before mutation.")
         if input(f"Type {phrase!r} to proceed: ") != phrase:
             raise SyncError("Cancelled; no content changes applied.")
-        job.apply(batch_size=args.batch_size)
+        job.apply(batch_size=args.batch_size, pause_after_batch=args.pause_after_batch)
 
 
 if __name__ == "__main__":

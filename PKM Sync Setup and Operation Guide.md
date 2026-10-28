@@ -1,8 +1,8 @@
 # PKM collect-then-push sync
 
-Version 2.0.0 uses the laptop as the authoritative Obsidian vault. It is not general-purpose bidirectional sync. The implementation was tested with mock local filesystems, not with the actual Android MTP mount. Preview the real device before applying.
+Version 2.1.1 uses the laptop as the authoritative Obsidian vault. It is not general-purpose bidirectional sync. Apply requires one approval, then all batches continue automatically through final verification. The implementation was tested with mock local filesystems, not with the actual Android MTP mount. Preview the real device before applying.
 
-Validation: 24 automated tests passed, including in-flight overwrite/create/deletion retries, backup preservation, and cursor resumption without phone rescanning. A local stress test completed 1,300 writes and final read-back verification in nine 300-operation batches under a 32-file-descriptor limit; descriptor counts were five before and five afterward. This establishes bounded descriptor use in the tested Python path, not absence of resource issues in an external MTP daemon.
+Validation: 29 automated tests passed, including phone-vault discovery/overrides, automatic continuation without batch prompts, compatibility with version 2.0 paused cursors, in-flight overwrite/create/deletion retries, backup preservation, and cursor resumption without phone rescanning. The version 2.0 transfer path also passed a local stress test of 1,300 writes and final read-back verification in nine 300-operation batches under a 32-file-descriptor limit; descriptor counts were five before and five afterward. This establishes bounded descriptor use in the tested Python path, not absence of resource issues in an external MTP daemon.
 
 ## Descriptor-exhaustion fix and recovery from version 1
 
@@ -28,21 +28,23 @@ This change trades atomic phone-file replacement for recoverability: an interrup
 
 ## Batches and persistent cursor
 
-The CLI defaults to at most 500 phone operations per invocation. There are no worker threads or concurrent file transfers. Use `--batch-size 100` for a smaller trial or a larger positive number to do more work per invocation without increasing concurrency.
+The CLI defaults to progress batches of 500 phone operations. Batches continue automatically in the same process until success or error, without repeated confirmation. There are no worker threads or concurrent file transfers. `--batch-size 100` changes the progress-batch interval, not concurrency.
 
 The budget covers phone file writes, file deletions, obsolete-directory checks, and final verification reads. It does not cap initial enumeration/hashing, local imports, source-tree revalidation, or the number of files represented in the plan.
 
-After each completed operation, the local cursor is saved. At the batch boundary the job reports `PAUSED`, not `SUCCESS`. Continue with:
+After each completed operation, the local cursor is saved. At an automatic batch boundary the job reports `CHECKPOINT` and continues. Use `--resume` only after an error, interruption, or deliberate manual pause:
 
 ```bash
 # Inspect the saved cursor/plan, without applying:
 ~/.local/bin/pkm-sync --resume
 
-# Continue the next batch:
+# Continue all remaining batches after one approval:
 ~/.local/bin/pkm-sync --resume --apply --batch-size 500
 ```
 
-Repeat the apply command until `SUCCESS`. Each invocation requires confirmation. Do not repeat `--initial` or `--mirror` with `--resume`: their original values are frozen in the saved plan. Resume does not rescan/replan the whole phone.
+Do not repeat `--initial` or `--mirror` with `--resume`: their original values are frozen in the saved plan. Resume does not rescan/replan the whole phone. Version 2.0 cursors work with version 2.1, including a cursor already in the verification phase. If the old run has not reported `SUCCESS`, resume rather than starting a new plan.
+
+For optional troubleshooting only, add `--pause-after-batch` to stop deliberately after one batch. This is no longer the default.
 
 Cursor and immutable plan:
 
@@ -53,7 +55,7 @@ Cursor and immutable plan:
 
 A local file lock prevents overlapping invocations. An active cursor prevents starting a different new run. An in-flight retry preserves the original backup rather than backing up partial replacement bytes over it.
 
-If a source changes while a batch is paused, resume stops rather than silently applying a new plan. Keep both sides inactive and resolve the change before continuing. No unattended loop or timer is installed.
+If a source changes while a batch is paused, resume stops rather than silently applying a new plan. Keep both sides inactive and resolve the change before continuing. No timer is installed; automatic batch continuation stays inside the single approved invocation.
 
 To inspect descriptor counts/limits without performing any sync or changing limits:
 
@@ -61,17 +63,29 @@ To inspect descriptor counts/limits without performing any sync or changing limi
 ~/.local/bin/pkm-sync --diagnose
 ```
 
-## Confirmed paths
+## Default paths
 
 | Role | Path |
 |---|---|
 | Laptop master | `~/PKM` |
-| Phone vault | `/mnt/android/Internal storage/Documents/PKM` |
+| Phone vault | Auto-discovered under `/mnt/android/Internal storage/Documents`, or explicitly configured |
 | Phone mountpoint | `/mnt/android`, mounted with `jmtpfs` |
 | Google Drive mount | `~/gdrive` |
 | Muse source | `~/gdrive/Muse` |
 | Muse destination in master | `External/Google_Drive` |
 | Journal location after initial deployment | `External/Journal` on both devices |
+
+`~` means the current user's home directory. Python uses `Path.home()` and the shell guard uses quoted `$HOME`; neither embeds a username. For new runs, phone discovery requires exactly one direct child of phone Documents containing `.obsidian`. Multiple or zero candidates stop the job rather than guessing. An existing phone folder need not be renamed.
+
+For a different phone location, use a private shell variable:
+
+```bash
+export PKM_PHONE_VAULT="/mnt/android/Internal storage/Documents/Your Vault"
+```
+
+Or pass `--phone-vault "/mnt/android/Internal storage/Documents/Your Vault"` on new preview/apply commands. Keep personal overrides outside the public repository. Resume uses the frozen checkpoint paths and does not rediscover or change its phone destination.
+
+Runtime logs, plans, checkpoints, import receipts, and backups can contain actual absolute paths and private filenames. Do not commit `~/.local/state/pkm-sync`, your rclone configuration, terminal transcripts, or vault content to the public repository. Publishing anonymized source files does not sanitize earlier Git history or previously uploaded logs.
 
 ## Install
 
@@ -82,7 +96,7 @@ mkdir -p ~/.local/bin
 install -m 755 ~/Downloads/pkm-sync.py ~/.local/bin/pkm-sync
 ```
 
-Run without sudo. Python 3, `findmnt`, and the already installed `~/.local/bin/pkm-gdrive-guard.sh` are required.
+Run as your normal laptop user, without sudo. Python 3, `findmnt`, and the installed `~/.local/bin/pkm-gdrive-guard.sh` are required.
 
 Do not enable the old `pkm-sync.timer` from the earlier design. If you enabled it previously, stop it before using this replacement:
 
@@ -113,13 +127,13 @@ All wanted phone content is already in the laptop master. The first deployment d
 
    The script recomputes and displays its plan, then requires you to type `MIRROR PHONE`.
 
-6. If `PAUSED` is printed, continue with `pkm-sync --resume --apply` until `SUCCESS`. Wait for `SUCCESS` before unmounting:
+6. Batches continue automatically. Wait for `SUCCESS` before unmounting:
 
    ```bash
    fusermount -u /mnt/android
    ```
 
-7. On Android, continue using the same vault folder, `Documents/PKM`. Change the daily-note/journal creation destination to `External/Journal`, including any mobile template or plugin setting that chooses the folder.
+7. On Android, continue using the same existing vault folder. Change the daily-note/journal creation destination to `External/Journal`, including any mobile template or plugin setting that chooses the folder.
 
 Preview creates a local state/lock directory and may recover the Drive mount. It does not modify vault or phone content.
 
@@ -134,7 +148,7 @@ With the phone mounted and inactive, and laptop editors/background writers stopp
 # Apply after reviewing the plan
 ~/.local/bin/pkm-sync --mirror --apply
 
-# If PAUSED, repeat this until SUCCESS:
+# Only if interrupted or deliberately paused:
 ~/.local/bin/pkm-sync --resume --apply
 ```
 

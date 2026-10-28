@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Local mock filesystem tests. Does not access Martin's phone or Drive."""
+"""Local mock filesystem tests. Does not access the user's phone or Drive."""
 import importlib.util
 import json
 import os
@@ -182,14 +182,14 @@ class Tests(unittest.TestCase):
         for i in range(7):
             self.write(self.master, f"note{i}.md", str(i))
         job = self.job()
-        self.assertFalse(job.apply(batch_size=2))
+        self.assertFalse(job.apply(batch_size=2, pause_after_batch=True))
         first_backup = job.backup
         self.assertEqual(job.progress["index"], 2)
         passes = 1
         while (self.state.parent / "active-run.json").exists():
             with patch.object(sync, "scan", side_effect=AssertionError("must not rescan")):
                 resumed = sync.Job.resume(self.state)
-                resumed.apply(batch_size=2)
+                resumed.apply(batch_size=2, pause_after_batch=True)
             self.assertEqual(resumed.backup, first_backup)
             passes += 1
             self.assertLess(passes, 20)
@@ -240,7 +240,7 @@ class Tests(unittest.TestCase):
     def test_cursor_prevents_new_run_over_active_run(self):
         self.write(self.master, "note.md", "new")
         self.write(self.phone, "extra.md", "old")
-        self.assertFalse(self.job().apply(batch_size=1))
+        self.assertFalse(self.job().apply(batch_size=1, pause_after_batch=True))
         other = self.job()
         with self.assertRaises(sync.SyncError):
             other.apply()
@@ -248,7 +248,7 @@ class Tests(unittest.TestCase):
     def test_master_change_between_batches_stops_resume(self):
         self.write(self.master, "note.md", "new")
         self.write(self.phone, "extra.md", "old")
-        self.assertFalse(self.job().apply(batch_size=1))
+        self.assertFalse(self.job().apply(batch_size=1, pause_after_batch=True))
         self.write(self.master, "note.md", "edited meanwhile")
         with self.assertRaises(sync.SyncError):
             sync.Job.resume(self.state).apply()
@@ -276,6 +276,41 @@ class Tests(unittest.TestCase):
                 job.apply()
         sync.Job.resume(self.state).apply()
         self.assertEqual((self.phone / "new.md").read_text(), "complete")
+
+    def test_default_batches_continue_to_success_without_input(self):
+        for i in range(5):
+            self.write(self.master, f"note{i}.md", str(i))
+        job = self.job()
+        with patch("builtins.input", side_effect=AssertionError("no batch prompts allowed")):
+            self.assertTrue(job.apply(batch_size=1))
+        self.assertFalse((self.state.parent / "active-run.json").exists())
+        self.assertTrue(json.loads(self.state.read_text())["initialized"])
+
+    def test_old_paused_cursor_resumes_with_automatic_batches(self):
+        for i in range(5):
+            self.write(self.master, f"note{i}.md", str(i))
+        job = self.job()
+        self.assertFalse(job.apply(batch_size=1, pause_after_batch=True))
+        resumed = sync.Job.resume(self.state)
+        with patch("builtins.input", side_effect=AssertionError("no batch prompts allowed")):
+            self.assertTrue(resumed.apply(batch_size=1))
+        self.assertFalse((self.state.parent / "active-run.json").exists())
+
+    def test_phone_discovery_uses_single_vault_without_embedded_username(self):
+        documents = self.root / "Documents"
+        (documents / "Personal Vault/.obsidian").mkdir(parents=True)
+        self.assertEqual(sync.resolve_phone_vault(documents=documents),
+                         documents / "Personal Vault")
+
+    def test_phone_discovery_refuses_ambiguous_vaults(self):
+        documents = self.root / "Documents"
+        for name in ("Vault A", "Vault B"):
+            (documents / name / ".obsidian").mkdir(parents=True)
+        with self.assertRaises(sync.SyncError):
+            sync.resolve_phone_vault(documents=documents)
+
+    def test_phone_path_override(self):
+        self.assertEqual(sync.resolve_phone_vault(str(self.phone)), self.phone)
 
 
 if __name__ == "__main__":
