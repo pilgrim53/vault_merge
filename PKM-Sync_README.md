@@ -2,7 +2,7 @@
 
 A preview-first, laptop-master synchronization tool for an Obsidian vault, an Android journal, and a Google Drive intake folder. Collect external updates into the laptop vault, then return the aggregated content to the phone.
 
-This is a controlled **collect-then-push workflow**, not unrestricted bidirectional sync. Version 2.1.1 asks for approval once, then continues sequentially through all batches and final verification.
+This is a controlled **collect-then-push workflow**, not unrestricted bidirectional sync. Version 2.2.0 asks for approval once, then continues sequentially through all batches and final verification. An optional XFCE/Zenity desktop watcher offers a reviewed sync when the phone is mounted.
 
 ## Workflow
 
@@ -27,7 +27,7 @@ Keep the phone inactive and close laptop vault editors, agents, and background w
 ## Safety boundaries
 
 - **Preview by default:** No vault or phone content is changed without `--apply`. Preview may recover the Drive mount and create the local state/lock directory.
-- **Explicit approval:** Apply requires an interactive terminal and one typed confirmation. It does not prompt again at each batch.
+- **Explicit approval:** Apply requires either an interactive terminal confirmation or a checked Zenity plan-review dialog with `--gui`. It does not prompt again at each batch.
 - **Verified transfers:** Compare SHA-256 content hashes, including final read-back verification of included phone files.
 - **Pre-change backups:** Save replaced or deleted file contents locally before mutation.
 - **Persistent recovery:** Save an immutable plan and durable cursor; retry an interrupted operation without overwriting its original backup.
@@ -44,6 +44,8 @@ Phone writes are deliberately non-atomic to avoid phone-side temporary-file rena
 ├── .gitignore
 ├── pkm-sync.py
 ├── pkm-gdrive-guard.sh
+├── pkm-watch.py
+├── install-desktop.sh
 ├── test-pkm-sync.py
 ├── PKM-sync-guide.md
 └── PKM-gdrive-guard-integration.md
@@ -209,6 +211,82 @@ Do not combine `--resume` with `--initial`, `--mirror`, or `--phone-vault`: the 
 
 Batches include phone writes, deletions, obsolete-directory checks, and verification reads. They do not cap initial enumeration/hashing or local imports.
 
+## Optional XFCE desktop watcher
+
+The watcher detects an already mounted phone; it does not mount USB devices itself. It polls `/mnt/android` every five seconds and requires two stable samples before preparing a sync.
+
+Prerequisites: a graphical XFCE session, Zenity, the configured Drive service, and an initial deployment already completed manually. `notify-send` is optional for desktop status notifications; detailed logs are saved either way.
+
+With the repository files together, run from a desktop terminal:
+
+```bash
+bash install-desktop.sh
+```
+
+The installer runs the tests, updates the local executables, generates a systemd user service and desktop-login autostart entry, imports the current graphical environment, and starts the watcher. It refuses a normal reinstall while the watcher is active and checks for an active sync/review lock. Install only while idle. If the phone is already mounted, a plan-review dialog may appear after installation.
+
+For installation without starting the watcher:
+
+```bash
+bash install-desktop.sh --no-start
+# Later, from a desktop terminal:
+systemctl --user daemon-reload
+"$HOME/.local/bin/pkm-watch-session"
+```
+
+The flow is:
+
+1. Detect the expected MTP mount and wait for accessible contents.
+2. If another sync holds the lock, wait rather than starting a competing job.
+3. Prepare a regular mirror plan, or load an existing unfinished run for resumption.
+4. Display the actual plan in one scrollable Zenity window.
+5. Check the approval box and select **Sync**, or select **Cancel**.
+6. Run all batches and final verification after that single approval.
+7. Report completion, cancellation, or failure; never report success with an active cursor remaining.
+
+Keep both devices inactive during review and apply. The watcher deliberately does not automate the first deployment. Cancellation or a handled failure does not produce a new prompt every poll. The handled boot/mount identity is stored locally; remounting offers another opportunity.
+
+To retry on the same mount without waiting for another watcher offer:
+
+```bash
+# Fresh regular plan:
+"$HOME/.local/bin/pkm-sync" --mirror --apply --gui
+# Or continue an unfinished run:
+"$HOME/.local/bin/pkm-sync" --resume --apply --gui
+```
+
+Do not add both commands to an automatic chain. Use the resume command if an unfinished cursor exists.
+
+Check status and logs:
+
+```bash
+systemctl --user status pkm-watch.service --no-pager
+journalctl --user -u pkm-watch.service -n 40 --no-pager
+"$HOME/.local/bin/pkm-watch" --check
+```
+
+Per-offer logs are private files under `~/.local/state/pkm-sync/desktop-*.log`. Graphical environment variables are imported at desktop login; the watcher is not enabled as a headless boot service. Generated files live at:
+
+```text
+~/.local/bin/pkm-watch
+~/.local/bin/pkm-watch-session
+~/.config/systemd/user/pkm-watch.service
+~/.config/autostart/pkm-watch.desktop
+~/.local/state/pkm-sync/watch-state.json
+```
+
+For multiple phone vaults, pass `PKM_PHONE_VAULT` into the session launcher from a private desktop environment. Keep any personal environment configuration outside the public repository.
+
+To disable, only while no sync or review is active:
+
+```bash
+systemctl --user stop pkm-watch.service
+mv "$HOME/.config/autostart/pkm-watch.desktop" \
+   "$HOME/.config/autostart/pkm-watch.desktop.disabled"
+```
+
+Stopping the service during an active run can interrupt its child sync. Use the cursor to recover rather than editing a partially updated phone.
+
 ## Update and move semantics
 
 - **New source versions:** Add unseen files; replace differing external master copies only when the source modification time is more than two seconds newer.
@@ -261,7 +339,7 @@ Run the mock-filesystem tests from the repository root:
 python3 test-pkm-sync.py
 ```
 
-Version 2.1.1 has 29 tests covering collection, exclusions, backup preservation, partial-operation recovery, automatic continuation, cursors, and phone-path discovery. Mock tests do not establish compatibility with every physical device or MTP implementation.
+Version 2.2.0 has 43 tests covering collection, exclusions, backup preservation, partial-operation recovery, automatic continuation, cursors, phone-path discovery, mount-disconnect guards, GUI approval/cancellation, and watcher behavior. Mock tests do not establish compatibility with every physical device, MTP implementation, or graphical session.
 
 ## Public repository hygiene
 
