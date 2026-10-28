@@ -1,18 +1,22 @@
 #!/usr/bin/env python3
 """PKM collect-then-push job. Preview by default; standard library only."""
 import argparse
+import contextlib
 import datetime as dt
 import fcntl
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
 import subprocess
+import shutil
 import sys
+import tempfile
 import uuid
 from dataclasses import dataclass
 
-VERSION = "2.1.1"
+VERSION = "2.2.0"
 
 EXCLUDED = {
     ".obsidian", ".agents", ".claude", ".copilot", ".opencode",
@@ -22,6 +26,49 @@ EXCLUDED = {
 
 class SyncError(Exception):
     pass
+
+
+class SyncCancelled(Exception):
+    pass
+
+
+def confirm_gui(job):
+    """Review the actual in-memory plan; no --yes flag or piped confirmation."""
+    if not shutil.which("zenity"):
+        raise SyncError("Zenity is required for --gui.")
+    if not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
+        raise SyncError("--gui requires an active graphical desktop environment.")
+    text = io.StringIO()
+    text.write("PKM Sync: review before applying\n\n")
+    if hasattr(job, "progress"):
+        text.write(
+            f"Resume saved run at {job.progress['phase']}[{job.progress['index']}].\n"
+            "The list below is the ORIGINAL plan; completed work will not be repeated.\n\n"
+        )
+    text.write(
+        "Keep the phone inactive and stop laptop vault editors/agents until SUCCESS.\n"
+        "Included phone files may be overwritten"
+        + (" or deleted." if job.mirror else ".")
+        + "\nOriginal file contents are backed up locally before replacement/deletion.\n"
+        "An interrupted phone write can be partial; use the saved cursor to recover.\n\n"
+    )
+    with contextlib.redirect_stdout(text):
+        job.display()
+    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", prefix="pkm-review-",
+                                     suffix=".txt") as review:
+        review.write(text.getvalue())
+        review.flush()
+        result = subprocess.run([
+            "zenity", "--text-info", "--title=PKM Sync: review plan",
+            f"--filename={review.name}", "--width=950", "--height=650",
+            "--checkbox=I have stopped editing on both devices and approve this plan.",
+            "--ok-label=Sync", "--cancel-label=Cancel",
+        ], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+    if result.returncode == 0:
+        return True
+    if result.returncode == 1:
+        return False
+    raise SyncError(f"Zenity failed with exit status {result.returncode}; no approval granted.")
 
 
 @dataclass
@@ -205,6 +252,19 @@ def resolve_phone_vault(explicit=None, documents=Path("/mnt/android/Internal sto
             "choose one with --phone-vault or PKM_PHONE_VAULT."
         )
     return candidates[0]
+
+
+def phone_mount_token():
+    """Guard against writing into the local directory after MTP unmount/remount."""
+    found = None
+    for line in Path("/proc/self/mountinfo").read_text().splitlines():
+        left, right = line.split(" - ", 1)
+        fields, filesystem = left.split(), right.split()
+        if fields[4] == "/mnt/android":
+            found = (fields[0], filesystem[0], filesystem[1])
+    if found is None or found[1] not in {"fuse.jmtpfs", "fuse.mtpfs"}:
+        raise SyncError("Expected Android MTP mount is absent; refusing phone writes.")
+    return found
 
 
 class Job:
@@ -405,6 +465,7 @@ class Job:
     def apply(self, batch_size=None, pause_after_batch=False):
         if batch_size is not None and batch_size < 1:
             raise SyncError("Batch size must be positive.")
+        self.check_phone_mount()
         if not hasattr(self, "progress"):
             # Check before opening an active run, so a preflight mismatch can be
             # corrected and freshly previewed without a resumable mutation.
@@ -446,13 +507,16 @@ class Job:
 
         if self.progress["phase"] == "pushes":
             for rel in sorted(self.desired_dirs, key=lambda s: (s.count("/"), s)):
+                self.check_phone_mount()
                 (self.phone / rel).mkdir(parents=True, exist_ok=True)
             while self.progress["index"] < len(self.pushes):
                 if pause_if_needed():
                     return False
                 rel, item, old = self.pushes[self.progress["index"]]
                 destination = self.phone / rel
+                self.check_phone_mount()
                 self.begin_operation("phone", rel, "replace" if old else "create", old, destination)
+                self.check_phone_mount()
                 copy_phone_checked(self.master / rel, destination, item.digest)
                 self.end_operation("phone", rel, "replace" if old else "create")
                 used += 1
@@ -466,7 +530,9 @@ class Job:
                 rel = self.deletes[self.progress["index"]]
                 old = self.phone_files[rel]
                 destination = self.phone / rel
+                self.check_phone_mount()
                 self.begin_operation("phone", rel, "delete", old, destination)
+                self.check_phone_mount()
                 if destination.exists():
                     destination.unlink()
                 self.end_operation("phone", rel, "delete")
@@ -480,6 +546,7 @@ class Job:
                     return False
                 rel = self.remove_dirs[self.progress["index"]]
                 directory = self.phone / rel
+                self.check_phone_mount()
                 if directory.is_dir():
                     # Explicitly close even when the directory is nonempty.
                     with os.scandir(directory) as entries:
@@ -517,6 +584,12 @@ class Job:
             return True
         raise SyncError(f"Unknown cursor phase: {self.progress['phase']}")
 
+    def check_phone_mount(self):
+        # CLI installs the live check; mock filesystem tests use no real mount.
+        callback = getattr(self, "phone_mount_check", None)
+        if callback:
+            callback()
+
     def validate_new_plan(self):
         # Validate the whole plan before any content mutation.
         for rel, item in self.master_files.items():
@@ -544,6 +617,8 @@ def main():
     parser.add_argument("--initial", action="store_true", help="Skip phone imports.")
     parser.add_argument("--mirror", action="store_true", help="Remove obsolete INCLUDED phone files.")
     parser.add_argument("--apply", action="store_true", help="Apply after interactive confirmation.")
+    parser.add_argument("--gui", action="store_true",
+                        help="With --apply, review and approve the plan in Zenity instead of a terminal.")
     parser.add_argument("--resume", action="store_true", help="Use the saved unfinished plan/cursor.")
     parser.add_argument("--batch-size", type=int, default=500,
                         help="Phone operations per progress batch; continues automatically (default 500).")
@@ -553,6 +628,8 @@ def main():
     parser.add_argument("--phone-vault", default=None,
                         help="Mounted phone vault path; otherwise use PKM_PHONE_VAULT or unique-vault discovery.")
     args = parser.parse_args()
+    if args.gui and not args.apply:
+        parser.error("--gui requires --apply")
     if args.diagnose:
         diagnostics()
         return
@@ -578,6 +655,7 @@ def main():
         ).stdout.strip()
         if mount not in {"fuse.jmtpfs", "fuse.mtpfs"}:
             raise SyncError(f"Expected jmtpfs/mtpfs at /mnt/android; found: {mount!r}")
+        expected_mount = phone_mount_token()
         for required in ("External/Journal", "External/Google_Drive", ".obsidian"):
             if not (home / "PKM" / required).is_dir():
                 raise SyncError(f"Expected master-vault directory missing: {home / 'PKM' / required}")
@@ -609,19 +687,30 @@ def main():
             print("PREVIEW ONLY. No vault or phone content changed.")
             print("The Drive guard may have mounted/recovered Drive; local lock directory was created.")
             return
-        if not sys.stdin.isatty():
-            raise SyncError("--apply requires an interactive terminal.")
-        phrase = "MIRROR PHONE" if job.mirror else "APPLY"
-        print("Keep the phone inactive and close Obsidian/editors/agents on the laptop.")
-        print("Replaced/deleted file contents will be backed up locally before mutation.")
-        if input(f"Type {phrase!r} to proceed: ") != phrase:
-            raise SyncError("Cancelled; no content changes applied.")
+        if args.gui:
+            if not confirm_gui(job):
+                raise SyncCancelled("Cancelled; no content changes applied by this invocation.")
+        else:
+            if not sys.stdin.isatty():
+                raise SyncError("--apply requires a terminal, or --gui with desktop approval.")
+            phrase = "MIRROR PHONE" if job.mirror else "APPLY"
+            print("Keep the phone inactive and close Obsidian/editors/agents on the laptop.")
+            print("Replaced/deleted file contents will be backed up locally before mutation.")
+            if input(f"Type {phrase!r} to proceed: ") != phrase:
+                raise SyncCancelled("Cancelled; no content changes applied by this invocation.")
+        def check_same_mount():
+            if phone_mount_token() != expected_mount:
+                raise SyncError("Phone mount changed since plan review. Stop and resume after checking it.")
+        job.phone_mount_check = check_same_mount
         job.apply(batch_size=args.batch_size, pause_after_batch=args.pause_after_batch)
 
 
 if __name__ == "__main__":
     try:
         main()
+    except SyncCancelled as error:
+        print(str(error), file=sys.stderr)
+        sys.exit(3)
     except (SyncError, OSError, ValueError, subprocess.SubprocessError) as error:
         print(f"STOPPED: {error}", file=sys.stderr)
         print("Do not resume phone editing if an apply was interrupted; inspect backups/log first.",

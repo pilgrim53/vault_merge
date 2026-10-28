@@ -1,8 +1,8 @@
 # PKM collect-then-push sync
 
-Version 2.1.1 uses the laptop as the authoritative Obsidian vault. It is not general-purpose bidirectional sync. Apply requires one approval, then all batches continue automatically through final verification. The implementation was tested with mock local filesystems, not with the actual Android MTP mount. Preview the real device before applying.
+Version 2.2.0 uses the laptop as the authoritative Obsidian vault. It is not general-purpose bidirectional sync. Apply requires one approval in a terminal or the optional Zenity review dialog, then all batches continue automatically through final verification. The implementation was tested with mock local filesystems, not with the actual Android MTP mount. Preview the real device before applying.
 
-Validation: 29 automated tests passed, including phone-vault discovery/overrides, automatic continuation without batch prompts, compatibility with version 2.0 paused cursors, in-flight overwrite/create/deletion retries, backup preservation, and cursor resumption without phone rescanning. The version 2.0 transfer path also passed a local stress test of 1,300 writes and final read-back verification in nine 300-operation batches under a 32-file-descriptor limit; descriptor counts were five before and five afterward. This establishes bounded descriptor use in the tested Python path, not absence of resource issues in an external MTP daemon.
+Validation: 43 automated tests passed, including mount-disconnect guards, GUI approval/cancellation, watcher behavior, phone-vault discovery/overrides, automatic continuation without batch prompts, compatibility with version 2.0 paused cursors, in-flight overwrite/create/deletion retries, backup preservation, and cursor resumption without phone rescanning. The version 2.0 transfer path also passed a local stress test of 1,300 writes and final read-back verification in nine 300-operation batches under a 32-file-descriptor limit; descriptor counts were five before and five afterward. This establishes bounded descriptor use in the tested Python path, not absence of resource issues in an external MTP daemon.
 
 ## Descriptor-exhaustion fix and recovery from version 1
 
@@ -104,7 +104,7 @@ Do not enable the old `pkm-sync.timer` from the earlier design. If you enabled i
 systemctl --user disable --now pkm-sync.timer
 ```
 
-If that unit does not exist, there is nothing to disable. Use this job manually while the phone is connected and inactive; no automatic timer is installed.
+If that unit does not exist, there is nothing to disable. Use this job manually while the phone is connected and inactive, or install the optional desktop watcher described in `README.md`. The watcher offers a GUI review rather than applying silently.
 
 ## First deployment
 
@@ -206,7 +206,7 @@ This is therefore a mirror of included vault content, not a byte-identical clone
 - File-versus-directory collisions stop for manual resolution rather than attempting destructive type conversion.
 - Phone writes avoid MTP renames and use verified direct writes with a durable in-flight cursor and local pre-change backups. This is not atomic; resume can retry a partially written file. Local mock tests do not establish device compatibility.
 - MTP may not preserve timestamps; the script warns if timestamp-setting fails. Phone return comparisons use hashes, not timestamps.
-- No unattended `--apply` is allowed. Mirror deletion requires both `--mirror` and typed confirmation.
+- No unattended `--apply` is allowed. Mirror deletion requires both `--mirror` and terminal confirmation or explicit approval of the graphical plan-review dialog.
 - Changes in a source file's bytes are detected with SHA-256; timestamps are used only to resolve competing incoming versions.
 - Keep the phone inactive through completion. Keep the master quiescent too; a checksum check cannot prevent an external writer changing a file immediately afterward.
 - Full-file hashing and read-back verification can be slow over MTP. The terminal may appear quiet during enumeration.

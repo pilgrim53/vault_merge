@@ -13,6 +13,10 @@ spec = importlib.util.spec_from_file_location("pkm_sync", Path(__file__).with_na
 sync = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = sync
 spec.loader.exec_module(sync)
+watch_spec = importlib.util.spec_from_file_location("pkm_watch", Path(__file__).with_name("pkm-watch.py"))
+watch = importlib.util.module_from_spec(watch_spec)
+sys.modules[watch_spec.name] = watch
+watch_spec.loader.exec_module(watch)
 
 
 class Tests(unittest.TestCase):
@@ -311,6 +315,126 @@ class Tests(unittest.TestCase):
 
     def test_phone_path_override(self):
         self.assertEqual(sync.resolve_phone_vault(str(self.phone)), self.phone)
+
+    def test_gui_approval_reviews_actual_plan(self):
+        self.write(self.master, "note.md", "new")
+        job = self.job()
+        def approve(command, **kwargs):
+            review = Path(next(a.split("=", 1)[1] for a in command if a.startswith("--filename=")))
+            text = review.read_text()
+            self.assertIn("PHONE ADD note.md", text)
+            self.assertIn("original", text.lower())
+            self.assertTrue(any(a.startswith("--checkbox=") for a in command))
+            return sync.subprocess.CompletedProcess(command, 0)
+        with patch.dict(os.environ, {"DISPLAY": ":test"}), \
+             patch.object(sync.shutil, "which", return_value="/usr/bin/zenity"), \
+             patch.object(sync.subprocess, "run", side_effect=approve):
+            self.assertTrue(sync.confirm_gui(job))
+        self.assertFalse(self.state.exists())
+        self.assertFalse((self.phone / "note.md").exists())
+
+    def test_gui_cancel_grants_no_approval(self):
+        job = self.job()
+        with patch.dict(os.environ, {"DISPLAY": ":test"}), \
+             patch.object(sync.shutil, "which", return_value="/usr/bin/zenity"), \
+             patch.object(sync.subprocess, "run",
+                          return_value=sync.subprocess.CompletedProcess([], 1)):
+            self.assertFalse(sync.confirm_gui(job))
+        self.assertFalse(self.state.exists())
+
+    def test_gui_tool_failure_is_not_approval(self):
+        job = self.job()
+        with patch.dict(os.environ, {"DISPLAY": ":test"}), \
+             patch.object(sync.shutil, "which", return_value="/usr/bin/zenity"), \
+             patch.object(sync.subprocess, "run",
+                          return_value=sync.subprocess.CompletedProcess([], 255)):
+            with self.assertRaises(sync.SyncError):
+                sync.confirm_gui(job)
+
+    def test_gui_refuses_missing_display(self):
+        with patch.dict(os.environ, {}, clear=True), \
+             patch.object(sync.shutil, "which", return_value="/usr/bin/zenity"):
+            with self.assertRaises(sync.SyncError):
+                sync.confirm_gui(self.job())
+
+    def test_mount_gate_debounces_and_suppresses_handled_mount(self):
+        gate = watch.MountGate()
+        self.assertFalse(gate.ready(None, None))
+        self.assertFalse(gate.ready("mount-a", None))
+        self.assertTrue(gate.ready("mount-a", None))
+        self.assertFalse(gate.ready("mount-a", "mount-a"))
+        self.assertFalse(gate.ready(None, "mount-a"))
+        self.assertFalse(gate.ready("mount-b", "mount-a"))
+        self.assertTrue(gate.ready("mount-b", "mount-a"))
+
+    def test_mount_probe_rejects_non_mtp_filesystem(self):
+        result = sync.subprocess.CompletedProcess([], 0, stdout="12 ext4 /dev/mock\n", stderr="")
+        with patch.object(watch.subprocess, "run", return_value=result):
+            self.assertIsNone(watch.mount_identity())
+
+    def test_watcher_does_not_automate_initial_deployment(self):
+        with patch.object(watch, "notify"), patch.object(watch.subprocess, "run") as runner:
+            self.assertEqual(watch.run_offer(self.root, self.state.parent), "setup-required")
+        runner.assert_not_called()
+
+    def test_watcher_runs_gui_regular_sync_after_initial(self):
+        self.state.write_text(json.dumps({"initialized": True}))
+        result = sync.subprocess.CompletedProcess([], 0)
+        with patch.object(watch, "notify") as notify, \
+             patch.object(watch.subprocess, "run", return_value=result) as runner:
+            self.assertEqual(watch.run_offer(self.root, self.state.parent), "success")
+        self.assertIn("--mirror", runner.call_args.args[0])
+        self.assertIn("--gui", runner.call_args.args[0])
+        self.assertEqual(notify.call_args.args[0], "PKM Sync complete")
+
+    def test_watcher_resumes_existing_cursor(self):
+        (self.state.parent / "active-run.json").write_text("{}")
+        result = sync.subprocess.CompletedProcess([], 0)
+        with patch.object(watch, "notify"), \
+             patch.object(watch.subprocess, "run", return_value=result) as runner:
+            self.assertEqual(watch.run_offer(self.root, self.state.parent), "unfinished")
+        self.assertIn("--resume", runner.call_args.args[0])
+        self.assertNotIn("--mirror", runner.call_args.args[0])
+
+    def test_watcher_cancellation_does_not_claim_success(self):
+        self.state.write_text(json.dumps({"initialized": True}))
+        with patch.object(watch, "notify") as notify, \
+             patch.object(watch.subprocess, "run",
+                          return_value=sync.subprocess.CompletedProcess([], 3)):
+            self.assertEqual(watch.run_offer(self.root, self.state.parent), "cancelled")
+        self.assertEqual(notify.call_args.args[0], "PKM Sync cancelled")
+
+    def test_watcher_failure_does_not_claim_success(self):
+        self.state.write_text(json.dumps({"initialized": True}))
+        with patch.object(watch, "notify") as notify, \
+             patch.object(watch.subprocess, "run",
+                          return_value=sync.subprocess.CompletedProcess([], 1)):
+            self.assertEqual(watch.run_offer(self.root, self.state.parent), "failed")
+        self.assertEqual(notify.call_args.args[0], "PKM Sync stopped")
+        self.assertTrue(notify.call_args.kwargs["urgent"])
+
+    def test_watcher_remembers_handled_mount(self):
+        path = self.state.parent / "watch-state.json"
+        watch.remember(path, "mount-token")
+        self.assertEqual(watch.read_json(path, {})["handled_mount"], "mount-token")
+
+    def test_phone_mount_token_requires_mtp(self):
+        with patch.object(Path, "read_text",
+                          return_value="12 1 0:1 / /mnt/android rw - ext4 /dev/mock rw\n"):
+            with self.assertRaises(sync.SyncError):
+                sync.phone_mount_token()
+        with patch.object(Path, "read_text",
+                          return_value="13 1 0:2 / /mnt/android rw - fuse.jmtpfs jmtpfs rw\n"):
+            self.assertEqual(sync.phone_mount_token(), ("13", "fuse.jmtpfs", "jmtpfs"))
+
+    def test_disconnected_mount_stops_apply_before_content_changes(self):
+        self.write(self.master, "new.md", "new")
+        job = self.job()
+        job.phone_mount_check = lambda: (_ for _ in ()).throw(sync.SyncError("disconnected"))
+        with self.assertRaises(sync.SyncError):
+            job.apply()
+        self.assertFalse((self.phone / "new.md").exists())
+        self.assertFalse((self.state.parent / "active-run.json").exists())
 
 
 if __name__ == "__main__":

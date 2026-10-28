@@ -48,22 +48,27 @@ def rsync_sync(source_dir: Path, destination_dir: Path):
     This preserves timestamps, copies only newer files, and excludes Obsidian
     metadata/trash folders.
     """
-    source_dir = Path(source_dir)
-    destination_dir = Path(destination_dir)
 
-    if not source_dir.exists():
-        raise FileNotFoundError(f"Source directory does not exist: {source_dir}")
+    source_dir = Path(source_dir).expanduser().resolve()
+    destination_dir = Path(destination_dir).expanduser().resolve()
 
-    destination_dir.mkdir(parents=True, exist_ok=True)
+    if not source_dir.is_dir():
+        raise NotADirectoryError(f"Source directory does not exist: {source_dir}")
+
+    if source_dir == destination_dir:
+        raise ValueError("Source and destination must be different")
+
+    if destination_dir == Path("/"):
+        raise ValueError("Refusing to sync into the filesystem root")
 
     cmd = [
         "rsync",
         "-a",
         "--update",
         "--inplace",
-        "--exclude", ".obsidian/",
-        "--exclude", ".trash/",
-        "--exclude", ".smart-env/",
+        # "--dry-run",
+        "--itemize-changes",
+        "--exclude", ".*/",
         f"{source_dir}/",
         str(destination_dir),
     ]
