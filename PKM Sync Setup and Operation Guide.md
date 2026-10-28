@@ -65,11 +65,11 @@ To inspect descriptor counts/limits without performing any sync or changing limi
 
 | Role | Path |
 |---|---|
-| Laptop master | `/home/martin/PKM` |
-| Phone vault | `/mnt/android/Internal storage/Documents/Martin PKM` |
+| Laptop master | `~/PKM` |
+| Phone vault | `/mnt/android/Internal storage/Documents/PKM` |
 | Phone mountpoint | `/mnt/android`, mounted with `jmtpfs` |
-| Google Drive mount | `/home/martin/gdrive` |
-| Muse source | `/home/martin/gdrive/Muse` |
+| Google Drive mount | `~/gdrive` |
+| Muse source | `~/gdrive/Muse` |
 | Muse destination in master | `External/Google_Drive` |
 | Journal location after initial deployment | `External/Journal` on both devices |
 
@@ -82,7 +82,7 @@ mkdir -p ~/.local/bin
 install -m 755 ~/Downloads/pkm-sync.py ~/.local/bin/pkm-sync
 ```
 
-Run as `martin`, without sudo. Python 3, `findmnt`, and the already installed `/home/martin/.local/bin/pkm-gdrive-guard.sh` are required.
+Run without sudo. Python 3, `findmnt`, and the already installed `~/.local/bin/pkm-gdrive-guard.sh` are required.
 
 Do not enable the old `pkm-sync.timer` from the earlier design. If you enabled it previously, stop it before using this replacement:
 
@@ -119,7 +119,7 @@ All wanted phone content is already in the laptop master. The first deployment d
    fusermount -u /mnt/android
    ```
 
-7. On Android, continue using the same vault folder, `Documents/Martin PKM`. Change the daily-note/journal creation destination to `External/Journal`, including any mobile template or plugin setting that chooses the folder.
+7. On Android, continue using the same vault folder, `Documents/PKM`. Change the daily-note/journal creation destination to `External/Journal`, including any mobile template or plugin setting that chooses the folder.
 
 Preview creates a local state/lock directory and may recover the Drive mount. It does not modify vault or phone content.
 
