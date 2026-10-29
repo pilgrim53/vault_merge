@@ -92,19 +92,19 @@ class Tests(unittest.TestCase):
         self.assertTrue((self.master / "External/Journal/local-only.md").exists())
         self.assertEqual((job.backup / "master/External/Journal/day.md").read_text(), "old")
 
-    def test_older_source_never_overwrites_newer_master(self):
+    def test_external_source_wins_even_with_older_timestamp(self):
         self.write(self.master, "External/Google_Drive/news.md", "new local", 2000)
         self.write(self.muse, "news.md", "old remote", 1000)
         job = self.job()
         job.apply()
-        self.assertEqual((self.master / "External/Google_Drive/news.md").read_text(), "new local")
+        self.assertEqual((self.master / "External/Google_Drive/news.md").read_text(), "old remote")
+        self.assertEqual((job.backup / "master/External/Google_Drive/news.md").read_text(), "new local")
 
-    def test_changed_source_ambiguous_timestamps_abort(self):
+    def test_external_source_wins_with_ambiguous_timestamps(self):
         self.write(self.master, "External/Google_Drive/news.md", "local", 1000)
         self.write(self.muse, "news.md", "remote", 1001)
-        with self.assertRaises(sync.SyncError):
-            self.job()
-        self.assertFalse(self.state.exists())
+        self.job().apply()
+        self.assertEqual((self.master / "External/Google_Drive/news.md").read_text(), "remote")
 
     def test_repeat_run_and_moved_import_do_not_resurrect(self):
         self.write(self.muse, "news.md", "remote")
@@ -147,6 +147,51 @@ class Tests(unittest.TestCase):
         self.write(self.phone, "path", "blocking file")
         with self.assertRaises(sync.SyncError):
             self.job()
+
+    def test_case_only_master_files_stop_before_any_phone_scan(self):
+        self.write(self.master, "Games/Trinity Journal.md", "one")
+        self.write(self.master, "Games/trinity journal.md", "different")
+        with patch.object(sync, "scan", wraps=sync.scan) as scanner:
+            with self.assertRaisesRegex(sync.SyncError, "Case-colliding"):
+                self.job()
+        self.assertEqual(scanner.call_count, 1)
+        self.assertFalse((self.state.parent / "active-run.json").exists())
+
+    def test_case_only_master_directories_rejected(self):
+        self.write(self.master, "Games/a.md", "one")
+        self.write(self.master, "games/b.md", "two")
+        with self.assertRaisesRegex(sync.SyncError, "Case-colliding"):
+            self.job()
+
+    def test_case_only_file_directory_pair_rejected(self):
+        self.write(self.master, "Folder", "file")
+        self.write(self.master, "folder/a.md", "child")
+        with self.assertRaisesRegex(sync.SyncError, "Case-colliding"):
+            self.job()
+
+    def test_drive_case_collision_rejected_before_import(self):
+        self.write(self.master, "External/Google_Drive/News.md", "master")
+        self.write(self.muse, "news.md", "source")
+        with self.assertRaisesRegex(sync.SyncError, "aggregated vault"):
+            self.job()
+        self.assertFalse((self.master / "External/Google_Drive/news.md").exists())
+
+    def test_phone_journal_case_collision_rejected_before_import(self):
+        self.job().apply()
+        self.write(self.master, "External/Journal/Day.md", "master")
+        self.write(self.phone, "External/Journal/day.md", "source")
+        with self.assertRaisesRegex(sync.SyncError, "aggregated vault"):
+            self.job(initial=False)
+        self.assertFalse((self.master / "External/Journal/day.md").exists())
+
+    def test_legacy_plan_case_collision_rejected_on_apply(self):
+        self.write(self.master, "note.md", "one")
+        job = self.job()
+        other = self.write(self.master, "Note.md", "two")
+        job.desired["Note.md"] = sync.inspect(other)
+        with self.assertRaisesRegex(sync.SyncError, "planned vault"):
+            job.apply()
+        self.assertFalse((self.phone / "note.md").exists())
 
     def test_do_not_repeat_initial_after_success(self):
         self.job().apply()
@@ -466,6 +511,218 @@ class Tests(unittest.TestCase):
         self.assertIn("Remaining: 0 imports, 0 phone writes, 0 phone file deletions.", text)
         self.assertIn("1 verification reads", text)
         self.assertNotIn("PHONE DELETE old.md", text)
+
+    def verification_job(self):
+        rel = "External/Journal/day.md"
+        self.write(self.master, rel, "original")
+        self.write(self.phone, rel, "original")
+        job = self.job()
+        job.start_run()
+        job.next_phase("verify")
+        return sync.Job.resume(self.state)
+
+    def test_reconcile_phone_edit_preserves_both_versions_and_old_cursor(self):
+        old = self.verification_job()
+        original_plan = (old.backup / "plan.json").read_bytes()
+        self.write(self.phone, "External/Journal/day.md", "phone edit")
+        job = old.reconciliation()
+        self.assertEqual(len(job.imports), 1)
+        self.assertFalse(self.state.exists())
+        job.apply()
+        self.assertEqual((self.master / "External/Journal/day.md").read_text(), "phone edit")
+        self.assertEqual((job.backup / "master/External/Journal/day.md").read_text(), "original")
+        self.assertEqual((job.backup / "reconciliation/phone/External/Journal/day.md").read_text(),
+                         "phone edit")
+        self.assertEqual(json.loads((job.backup / "superseded-active-run.json").read_text()),
+                         old.progress)
+        self.assertEqual((old.backup / "plan.json").read_bytes(), original_plan)
+        self.assertTrue(json.loads(self.state.read_text())["initialized"])
+
+    def test_reconcile_preview_leaves_old_cursor_and_vaults_untouched(self):
+        old = self.verification_job()
+        active = self.state.parent / "active-run.json"
+        before = active.read_bytes()
+        self.write(self.phone, "External/Journal/day.md", "phone edit")
+        old.reconciliation()
+        self.assertEqual(active.read_bytes(), before)
+        self.assertFalse(self.state.exists())
+        self.assertEqual((self.master / "External/Journal/day.md").read_text(), "original")
+
+    def test_reconcile_phone_wins_when_both_copies_changed(self):
+        old = self.verification_job()
+        self.write(self.master, "External/Journal/day.md", "master edit")
+        self.write(self.phone, "External/Journal/day.md", "phone edit")
+        job = old.reconciliation()
+        job.apply()
+        self.assertEqual((self.master / "External/Journal/day.md").read_text(), "phone edit")
+        self.assertEqual((job.backup / "master/External/Journal/day.md").read_text(), "master edit")
+
+    def test_reconcile_phone_wins_even_if_only_master_was_edited(self):
+        old = self.verification_job()
+        self.write(self.master, "External/Journal/day.md", "master edit")
+        job = old.reconciliation()
+        self.assertEqual(len(job.imports), 1)
+        job.apply()
+        self.assertEqual((self.master / "External/Journal/day.md").read_text(), "original")
+        self.assertEqual((job.backup / "master/External/Journal/day.md").read_text(), "master edit")
+
+    def test_reconcile_same_edit_on_both_copies_needs_no_transfer(self):
+        old = self.verification_job()
+        self.write(self.master, "External/Journal/day.md", "same edit")
+        self.write(self.phone, "External/Journal/day.md", "same edit")
+        job = old.reconciliation()
+        self.assertFalse(job.imports)
+        self.assertFalse(job.pushes)
+        job.apply()
+
+    def test_reconcile_new_phone_entry_imported_without_timestamp_guessing(self):
+        old = self.verification_job()
+        self.write(self.phone, "External/Journal/new.md", "new entry", 10)
+        job = old.reconciliation()
+        job.apply()
+        self.assertEqual((self.master / "External/Journal/new.md").read_text(), "new entry")
+
+    def test_reconcile_missing_phone_file_is_restored_from_master(self):
+        old = self.verification_job()
+        (self.phone / "External/Journal/day.md").unlink()
+        job = old.reconciliation()
+        job.apply()
+        self.assertEqual((self.phone / "External/Journal/day.md").read_text(), "original")
+
+    def test_reconcile_master_move_not_resurrected_from_unchanged_phone(self):
+        old = self.verification_job()
+        (self.master / "External/Journal/day.md").rename(self.master / "moved.md")
+        job = old.reconciliation()
+        self.assertFalse(job.imports)
+        job.apply()
+        self.assertFalse((self.master / "External/Journal/day.md").exists())
+        self.assertEqual((self.phone / "moved.md").read_text(), "original")
+
+    def test_reconcile_new_phone_version_imports_after_master_move(self):
+        old = self.verification_job()
+        (self.master / "External/Journal/day.md").rename(self.master / "moved.md")
+        self.write(self.phone, "External/Journal/day.md", "phone edit")
+        old.reconciliation().apply()
+        self.assertEqual((self.master / "External/Journal/day.md").read_text(), "phone edit")
+        self.assertEqual((self.master / "moved.md").read_text(), "original")
+
+    def test_phone_receipt_does_not_block_source_winning_existing_target(self):
+        self.write(self.master, "External/Journal/day.md", "original")
+        self.job().apply()
+        self.write(self.master, "External/Journal/day.md", "master edited", 3000)
+        job = self.job(initial=False)
+        job.apply()
+        self.assertEqual((self.master / "External/Journal/day.md").read_text(), "original")
+
+    def test_drive_receipt_does_not_block_source_winning_existing_target(self):
+        self.write(self.muse, "news.md", "source")
+        self.job().apply()
+        self.write(self.master, "External/Google_Drive/news.md", "master edited", 3000)
+        self.job(initial=False).apply()
+        self.assertEqual((self.master / "External/Google_Drive/news.md").read_text(), "source")
+
+    def test_reconcile_rejects_nonverification_or_inflight_cursor(self):
+        old = self.verification_job()
+        old.progress["phase"] = "imports"
+        with self.assertRaises(sync.SyncError):
+            old.reconciliation()
+        old.progress.update(phase="verify", inflight=True)
+        with self.assertRaises(sync.SyncError):
+            old.reconciliation()
+
+    def interrupted_game_write(self, replacing=False):
+        self.write(self.master, "External/Journal/day.md", "journal")
+        self.write(self.phone, "External/Journal/day.md", "journal")
+        self.write(self.master, "Games/note.md", "complete master")
+        if replacing:
+            self.write(self.phone, "Games/note.md", "original phone")
+        job = self.job()
+        def fail_write(source, destination, expected):
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_text("partial")
+            raise OSError("simulated interrupted transfer")
+        with patch.object(sync, "copy_phone_checked", side_effect=fail_write):
+            with self.assertRaises(OSError):
+                job.apply()
+        self.assertEqual(job.progress["phase"], "pushes")
+        self.assertTrue(job.progress["inflight"])
+        return sync.Job.resume(self.state)
+
+    def test_reconcile_interrupted_nonjournal_write_after_source_rename(self):
+        old = self.interrupted_game_write()
+        (self.master / "Games/note.md").rename(self.master / "Games/distinct-name.md")
+        self.write(self.phone, "External/Journal/day.md", "new phone journal")
+        job = old.reconciliation()
+        self.assertEqual(json.loads((self.state.parent / "active-run.json").read_text()),
+                         old.progress)
+        job.apply()
+        self.assertEqual((self.phone / "Games/distinct-name.md").read_text(), "complete master")
+        self.assertFalse((self.phone / "Games/note.md").exists())
+        self.assertEqual((job.backup / "phone/Games/note.md").read_text(), "partial")
+        self.assertEqual((self.master / "External/Journal/day.md").read_text(), "new phone journal")
+        self.assertTrue(json.loads((job.backup / "superseded-active-run.json").read_text())["inflight"])
+
+    def test_reconcile_interrupted_replace_retains_original_old_backup(self):
+        old = self.interrupted_game_write(replacing=True)
+        saved = old.backup / "phone/Games/note.md"
+        self.assertEqual(saved.read_text(), "original phone")
+        job = old.reconciliation()
+        job.apply()
+        self.assertEqual(saved.read_text(), "original phone")
+        self.assertEqual((job.backup / "phone/Games/note.md").read_text(), "partial")
+
+    def test_reconcile_interrupted_journal_write_rejected(self):
+        old = self.interrupted_game_write()
+        rel = "External/Journal/day.md"
+        old.pushes = [(rel, sync.inspect(self.master / rel), None)]
+        with self.assertRaisesRegex(sync.SyncError, "interrupted Journal write"):
+            old.reconciliation()
+
+    def test_reconcile_push_phase_without_inflight_allowed(self):
+        old = self.verification_job()
+        old.progress.update(phase="pushes", index=0)
+        old.checkpoint()
+        old.reconciliation().apply()
+        self.assertTrue(json.loads(self.state.read_text())["initialized"])
+
+    def test_reconcile_invalid_inflight_cursor_rejected(self):
+        old = self.verification_job()
+        old.progress.update(phase="pushes", index=len(old.pushes), inflight=True)
+        with self.assertRaisesRegex(sync.SyncError, "Invalid in-flight"):
+            old.reconciliation()
+
+    def test_reconcile_cursor_changed_since_preview_stops_before_mutation(self):
+        old = self.verification_job()
+        self.write(self.phone, "External/Journal/day.md", "phone edit")
+        job = old.reconciliation()
+        old.progress["index"] = 1
+        old.checkpoint()
+        with self.assertRaisesRegex(sync.SyncError, "cursor changed"):
+            job.apply()
+        self.assertEqual((self.master / "External/Journal/day.md").read_text(), "original")
+
+    def test_reconcile_journal_backup_failure_retains_original_cursor(self):
+        old = self.verification_job()
+        self.write(self.phone, "External/Journal/day.md", "phone edit")
+        job = old.reconciliation()
+        with patch.object(sync, "copy_checked", side_effect=OSError("backup failed")):
+            with self.assertRaisesRegex(OSError, "backup failed"):
+                job.apply()
+        self.assertEqual(json.loads((self.state.parent / "active-run.json").read_text()),
+                         old.progress)
+        self.assertEqual((self.master / "External/Journal/day.md").read_text(), "original")
+
+    def test_reconcile_run_can_resume_after_a_batch_pause(self):
+        old = self.verification_job()
+        self.write(self.phone, "External/Journal/day.md", "phone edit")
+        self.write(self.master, "new.md", "new master file")
+        job = old.reconciliation()
+        self.assertFalse(job.apply(batch_size=1, pause_after_batch=True))
+        resumed = sync.Job.resume(self.state)
+        self.assertEqual(resumed.reconcile_cursor, old.progress)
+        resumed.apply()
+        self.assertEqual((self.phone / "new.md").read_text(), "new master file")
+        self.assertTrue(json.loads(self.state.read_text())["initialized"])
 
 
 if __name__ == "__main__":

@@ -16,7 +16,7 @@ import tempfile
 import uuid
 from dataclasses import dataclass
 
-VERSION = "2.2.1"
+VERSION = "2.3.1"
 
 EXCLUDED = {
     ".obsidian", ".agents", ".claude", ".copilot", ".opencode",
@@ -117,6 +117,28 @@ def scan(root, exclusions=False):
             path = base / name
             files[path.relative_to(root).as_posix()] = inspect(path)
     return files, directories
+
+
+def check_case_collisions(files, directories, label):
+    """Conservative Android portability check, including ancestor directories."""
+    seen = {}
+    collisions = []
+    for rel in sorted(set(files) | set(directories)):
+        key = rel.casefold()
+        if key in seen and seen[key] != rel:
+            collisions.append(f"  {seen[key]}\n  {rel}")
+        else:
+            seen[key] = rel
+    if collisions:
+        details = "\n".join(collisions[:10])
+        if len(collisions) > 10:
+            details += f"\n  ...and {len(collisions) - 10} more collisions"
+        raise SyncError(
+            f"Case-colliding paths in {label}; these cannot safely share a "
+            f"case-insensitive destination:\n{details}\n"
+            "Preserve both contents and rename notes/folders distinctly in Obsidian. "
+            "No transfer attempted; a saved plan may require --reconcile after renaming."
+        )
 
 
 def assert_unchanged(path, expected):
@@ -297,26 +319,14 @@ class Job:
             key = source + ":" + rel
             target = prefix + "/" + rel
             current = desired.get(target)
-            # Already incorporated content must not resurrect a moved/deleted note.
-            if item.digest in self.state["receipts"].get(key, []):
-                continue
             if current and current.digest == item.digest:
                 self.receipt(source, rel, item.digest)
                 continue
-            if current:
-                delta = item.mtime - current.mtime
-                # MTP timestamp resolution/semantics vary. Never guess on a tie.
-                if abs(delta) <= 2:
-                    raise SyncError(
-                        f"Different content with ambiguous timestamps: {item.path} "
-                        f"and {self.master / target}. Resolve manually before syncing."
-                    )
-                if delta < 0:
-                    self.messages.append(f"KEEP newer master: {target}")
-                    # Remember this deliberately rejected source version too, so
-                    # moving the newer master later cannot resurrect the old copy.
-                    self.receipt(source, rel, item.digest)
-                    continue
+            # External sources own same-path contents, regardless of timestamps.
+            # Receipts only suppress resurrection when the target is absent;
+            # they must not prevent a source overwriting an existing target.
+            if current is None and item.digest in self.state["receipts"].get(key, []):
+                continue
             self.imports.append((target, item, current))
             desired[target] = item
             self.receipt(source, rel, item.digest)
@@ -326,17 +336,24 @@ class Job:
             while parent != Path("."):
                 self.desired_dirs.add(parent.as_posix())
                 parent = parent.parent
+        return files
 
     def plan(self):
         self.master_files, self.desired_dirs = scan(self.master, exclusions=True)
+        check_case_collisions(self.master_files, self.desired_dirs, "master vault")
         desired = dict(self.master_files)
         self.phone_files, self.phone_dirs = scan(self.phone, exclusions=True)
-        if not self.initial:
-            self.collect(
+        if getattr(self, "reconcile_cursor", None) or not self.initial:
+            journal = self.collect(
                 "phone", self.phone / "External/Journal",
                 "External/Journal", desired,
             )
+            if getattr(self, "reconcile_cursor", None):
+                self.recovery_journal = {
+                    "External/Journal/" + rel: item for rel, item in journal.items()
+                }
         self.collect("drive", self.muse, "External/Google_Drive", desired)
+        check_case_collisions(desired, self.desired_dirs, "aggregated vault")
         for path in self.desired_dirs:
             if path in self.phone_files:
                 raise SyncError(f"Phone file blocks required directory: {path}")
@@ -354,12 +371,58 @@ class Job:
             if self.mirror else []
         )
 
+    def reconciliation(self):
+        """Preview a replacement plan; never bless an unverified old run."""
+        phase = self.progress["phase"]
+        if phase == "verify" and not self.progress["inflight"]:
+            pass
+        elif phase == "pushes":
+            index = self.progress["index"]
+            if not 0 <= index <= len(self.pushes):
+                raise SyncError("Invalid saved phone-write cursor.")
+            if self.progress["inflight"]:
+                if index == len(self.pushes):
+                    raise SyncError("Invalid in-flight phone-write cursor.")
+                rel = self.pushes[index][0]
+                if rel.startswith("External/Journal/"):
+                    raise SyncError(
+                        "Cannot reconcile an interrupted Journal write: the phone source "
+                        "may be partial. Recover it from the saved plan/backups first."
+                    )
+        else:
+            raise SyncError(
+                "Reconciliation requires verification with no in-flight operation, "
+                "or the phone-write phase with no interrupted Journal write."
+            )
+        job = Job(self.master, self.phone, self.muse, self.state_path,
+                  initial=self.initial, mirror=self.mirror)
+        # Imports completed before either permitted phase. Retain their
+        # receipts, but do not set initialized or last_success.
+        job.state = json.loads(json.dumps(self.state))
+        job.reconcile_cursor = dict(self.progress)
+        # Remember journal versions that were already present/copied on the
+        # phone, only for moved-file suppression, never to arbitrate contents.
+        completed_writes = {
+            rel for rel, _, _ in self.pushes[:self.progress["index"]]
+        } if phase == "pushes" else set(self.desired)
+        for rel, item in self.desired.items():
+            if rel.startswith("External/Journal/"):
+                prior = self.phone_files.get(rel)
+                if rel in completed_writes or (prior and prior.digest == item.digest):
+                    job.receipt("phone", rel[len("External/Journal/"):], item.digest)
+        job.plan()
+        return job
+
     def display(self):
         resumable = hasattr(self, "progress")
         mode = "INITIAL (no phone import)" if self.initial else "REGULAR"
+        if getattr(self, "reconcile_cursor", None):
+            mode = "RECONCILIATION (phone-authoritative journal recovery)"
         print("MODE:", ("RESUME " if resumable else "") + mode)
         print("MASTER:", self.master)
         print("PHONE:", self.phone)
+        print("EXTERNAL POLICY: phone owns Journal; Drive owns Google_Drive. "
+              "Source wins same-path differences; replaced master copies are backed up.")
         label = "Saved snapshot (not a live scan)" if resumable else "Included files"
         print(f"{label}: master={len(self.master_files)}, phone={len(self.phone_files)}")
         imports, pushes, deletes = self.imports, self.pushes, self.deletes
@@ -413,6 +476,7 @@ class Job:
             "pushes": [[r, pack_item(i), pack_item(o)] for r, i, o in self.pushes],
             "deletes": self.deletes, "remove_dirs": self.remove_dirs,
             "messages": self.messages,
+            "supersedes": getattr(self, "reconcile_cursor", None),
         }
         write_json_atomic(self.backup / "plan.json", value)
 
@@ -439,6 +503,7 @@ class Job:
             setattr(self, name, [(r, unpack_item(i), unpack_item(o))
                                 for r, i, o in value[name]])
         self.backup, self.progress = backup, progress
+        self.reconcile_cursor = value.get("supersedes")
         self.journal = backup / "operations.jsonl"
         return self
 
@@ -447,13 +512,23 @@ class Job:
 
     def start_run(self):
         active = self.state_path.parent / "active-run.json"
-        if active.exists():
+        previous = getattr(self, "reconcile_cursor", None)
+        if previous:
+            if not active.exists() or json.loads(active.read_text()) != previous:
+                raise SyncError("Saved cursor changed since reconciliation preview. Replan recovery.")
+        elif active.exists():
             raise SyncError("An unfinished run exists. Use --resume, not a new run.")
         run = dt.datetime.now().astimezone().strftime("%Y%m%dT%H%M%S%z") + "-" + uuid.uuid4().hex[:8]
         self.backup = self.state_path.parent / "backups" / run
         self.backup.mkdir(parents=True, exist_ok=False)
         self.journal = self.backup / "operations.jsonl"
         self.save_plan()
+        if previous:
+            # Archive, do not erase, the original recovery record. Old backup
+            # directories and their plans/logs are never modified.
+            write_json_atomic(self.backup / "superseded-active-run.json", previous)
+            for rel, item in self.recovery_journal.items():
+                copy_checked(item.path, self.backup / "reconciliation/phone" / rel, item.digest)
         self.progress = {
             "backup": str(self.backup), "run": run, "phase": "imports", "index": 0,
             "inflight": False,
@@ -492,6 +567,7 @@ class Job:
         if batch_size is not None and batch_size < 1:
             raise SyncError("Batch size must be positive.")
         self.check_phone_mount()
+        check_case_collisions(self.desired, self.desired_dirs, "planned vault")
         if not hasattr(self, "progress"):
             # Check before opening an active run, so a preflight mismatch can be
             # corrected and freshly previewed without a resumable mutation.
@@ -646,6 +722,8 @@ def main():
     parser.add_argument("--gui", action="store_true",
                         help="With --apply, review and approve the plan in Zenity instead of a terminal.")
     parser.add_argument("--resume", action="store_true", help="Use the saved unfinished plan/cursor.")
+    parser.add_argument("--reconcile", action="store_true",
+                        help="Replan verification or a safe interrupted phone-write phase; phone owns Journal.")
     parser.add_argument("--batch-size", type=int, default=500,
                         help="Phone operations per progress batch; continues automatically (default 500).")
     parser.add_argument("--pause-after-batch", action="store_true",
@@ -663,6 +741,8 @@ def main():
         parser.error("--batch-size must be positive")
     if args.resume and (args.initial or args.mirror or args.phone_vault):
         parser.error("--resume uses the saved flags/path; omit --initial, --mirror and --phone-vault")
+    if args.reconcile and (args.resume or args.initial or args.mirror or args.phone_vault):
+        parser.error("--reconcile uses the saved vault/flags; omit --resume, --initial, --mirror and --phone-vault")
     if os.getuid() == 0:
         raise SyncError("Run as your normal laptop user, not with sudo.")
     home = Path.home()
@@ -686,7 +766,14 @@ def main():
             if not (home / "PKM" / required).is_dir():
                 raise SyncError(f"Expected master-vault directory missing: {home / 'PKM' / required}")
         state_path = state_dir / "state.json"
-        if args.resume:
+        if args.reconcile:
+            saved = Job.resume(state_path)
+            print("Reading current files for reconciliation; no vault/phone content writes yet.", flush=True)
+            job = saved.reconciliation()
+            print("The old plan/cursor will be archived only after approval.")
+            print("Phone journals will be preserved locally before replacing the cursor.")
+            job.display()
+        elif args.resume:
             job = Job.resume(state_path)
             print(f"RESUME: {job.progress['phase']}[{job.progress['index']}]; "
                   f"in-flight operation={job.progress['inflight']}")
