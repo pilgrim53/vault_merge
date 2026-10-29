@@ -4,6 +4,8 @@ A preview-first, laptop-master synchronization tool for an Obsidian vault, an An
 
 This is a controlled **collect-then-push workflow**, not unrestricted bidirectional sync. Version 2.3.2 asks for approval once, then continues sequentially through all batches and final verification. An optional XFCE/Zenity desktop watcher offers a reviewed sync when the phone is mounted.
 
+For everyday commands and recovery decisions, start with the [PKM Sync Command Cheat Sheet](PKM-sync-command-cheat-sheet.md). Normal use is `pkm-sync --mirror` to preview and `pkm-sync --mirror --apply` to review and apply; `--resume` and `--reconcile` are only for unfinished runs.
+
 ## Workflow
 
 ```text
