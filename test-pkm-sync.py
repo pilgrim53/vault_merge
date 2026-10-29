@@ -691,6 +691,138 @@ class Tests(unittest.TestCase):
         with self.assertRaisesRegex(sync.SyncError, "Invalid in-flight"):
             old.reconciliation()
 
+    def abandoned_alias_job(self, replacing=False):
+        old = self.interrupted_game_write(replacing=replacing)
+        (self.master / "Games/note.md").unlink()
+        self.write(self.master, "Games/Note.md", "wanted distinct contents")
+        self.write(self.phone, "Games/Note.md", "wanted distinct contents")
+        return old
+
+    def alias_inspector(self, extra_bad=()):
+        original = sync.inspect
+        bad = {self.phone / "Games/note.md", *extra_bad}
+        def checked(path):
+            if Path(path) in bad:
+                raise OSError(5, "simulated unreadable MTP entry", str(path))
+            return original(path)
+        return checked
+
+    def test_abandoned_create_alias_recovers_without_reading_or_deleting_it(self):
+        old = self.abandoned_alias_job()
+        active = self.state.parent / "active-run.json"
+        prior = active.read_bytes()
+        with patch.object(sync, "inspect", side_effect=self.alias_inspector()):
+            job = old.reconciliation()
+            self.assertEqual(active.read_bytes(), prior)
+            self.assertFalse(self.state.exists())
+            self.assertNotIn("Games/note.md", job.deletes)
+            job.apply()
+        self.assertEqual((self.phone / "Games/note.md").read_text(), "partial")
+        self.assertEqual((self.phone / "Games/Note.md").read_text(), "wanted distinct contents")
+        state = json.loads(self.state.read_text())
+        self.assertEqual(state["abandoned_phone_aliases"]["Games/note.md"]["kept"], "Games/Note.md")
+        self.assertEqual(json.loads((job.backup / "superseded-active-run.json").read_text()),
+                         old.progress)
+
+    def test_recorded_alias_exception_works_on_next_regular_sync(self):
+        old = self.abandoned_alias_job()
+        with patch.object(sync, "inspect", side_effect=self.alias_inspector()):
+            old.reconciliation().apply()
+            normal = self.job(initial=False)
+            self.assertFalse(normal.pushes)
+            self.assertFalse(normal.deletes)
+            normal.apply()
+
+    def test_abandoned_alias_preview_and_success_disclose_mirror_exception(self):
+        old = self.abandoned_alias_job()
+        output = io.StringIO()
+        with patch.object(sync, "inspect", side_effect=self.alias_inspector()):
+            job = old.reconciliation()
+            with contextlib.redirect_stdout(output):
+                job.display()
+                job.apply()
+        self.assertIn("PHONE ALIAS EXCEPTION", output.getvalue())
+        self.assertIn("strict mirror has recorded abandoned-name exceptions", output.getvalue())
+
+    def test_abandoned_replacement_not_eligible_for_alias_exception(self):
+        old = self.abandoned_alias_job(replacing=True)
+        with patch.object(sync, "inspect", side_effect=self.alias_inspector()):
+            with self.assertRaises(OSError):
+                old.reconciliation()
+
+    def test_source_still_wanted_does_not_get_alias_exception(self):
+        old = self.interrupted_game_write()
+        with patch.object(sync, "inspect", side_effect=self.alias_inspector()):
+            with self.assertRaises(OSError):
+                old.reconciliation()
+
+    def test_unrelated_unreadable_file_still_stops_reconciliation(self):
+        old = self.abandoned_alias_job()
+        bad = self.write(self.phone, "Games/unrelated.md", "important")
+        with patch.object(sync, "inspect", side_effect=self.alias_inspector({bad})):
+            with self.assertRaises(OSError):
+                old.reconciliation()
+        self.assertEqual(json.loads((self.state.parent / "active-run.json").read_text()), old.progress)
+
+    def test_unreadable_retained_alias_still_stops_reconciliation(self):
+        old = self.abandoned_alias_job()
+        with patch.object(sync, "inspect", side_effect=self.alias_inspector({self.phone / "Games/Note.md"})):
+            with self.assertRaises(OSError):
+                old.reconciliation()
+
+    def test_alias_canonical_path_is_inspected_when_only_old_name_is_listed(self):
+        old = self.abandoned_alias_job()
+        (self.phone / "Games/Note.md").unlink()
+        source = sync.inspect(self.master / "Games/Note.md")
+        original = self.alias_inspector()
+        def checked(path):
+            if Path(path) == self.phone / "Games/Note.md":
+                return sync.Item(Path(path), source.digest, source.size, source.mtime)
+            return original(path)
+        with patch.object(sync, "inspect", side_effect=checked):
+            job = old.reconciliation()
+        self.assertEqual(job.phone_files["Games/Note.md"].digest, source.digest)
+
+    def test_alias_exception_does_not_hide_ordinary_mirror_deletions(self):
+        old = self.abandoned_alias_job()
+        self.write(self.phone, "Games/extra.md", "old extra")
+        with patch.object(sync, "inspect", side_effect=self.alias_inspector()):
+            job = old.reconciliation()
+            self.assertIn("Games/extra.md", job.deletes)
+            job.apply()
+        self.assertEqual((job.backup / "phone/Games/extra.md").read_text(), "old extra")
+
+    def test_recorded_exception_never_applies_to_external_files(self):
+        self.write(self.master, "External/Journal/Day.md", "journal")
+        bad = self.write(self.phone, "External/Journal/day.md", "unreadable journal")
+        state = {
+            "initialized": True, "receipts": {}, "abandoned_phone_aliases": {
+                "External/Journal/day.md": {"kept": "External/Journal/Day.md", "origin_run": "old"}
+            }
+        }
+        self.state.write_text(json.dumps(state))
+        with patch.object(sync, "inspect", side_effect=self.alias_inspector({bad})):
+            with self.assertRaises(OSError):
+                self.job(initial=False)
+
+    def test_recorded_exception_cannot_bypass_reintroduced_source_collision(self):
+        old = self.abandoned_alias_job()
+        with patch.object(sync, "inspect", side_effect=self.alias_inspector()):
+            old.reconciliation().apply()
+        self.write(self.master, "Games/note.md", "new content")
+        with self.assertRaisesRegex(sync.SyncError, "Case-colliding"):
+            self.job(initial=False)
+
+    def test_abandoned_alias_recovery_can_resume_with_exception_preserved(self):
+        old = self.abandoned_alias_job()
+        self.write(self.master, "new.md", "new")
+        with patch.object(sync, "inspect", side_effect=self.alias_inspector()):
+            job = old.reconciliation()
+            self.assertFalse(job.apply(batch_size=1, pause_after_batch=True))
+            resumed = sync.Job.resume(self.state)
+            resumed.apply()
+        self.assertIn("Games/note.md", json.loads(self.state.read_text())["abandoned_phone_aliases"])
+
     def test_reconcile_cursor_changed_since_preview_stops_before_mutation(self):
         old = self.verification_job()
         self.write(self.phone, "External/Journal/day.md", "phone edit")

@@ -16,7 +16,7 @@ import tempfile
 import uuid
 from dataclasses import dataclass
 
-VERSION = "2.3.1"
+VERSION = "2.3.2"
 
 EXCLUDED = {
     ".obsidian", ".agents", ".claude", ".copilot", ".opencode",
@@ -95,7 +95,7 @@ def inspect(path):
     return Item(path, h.hexdigest(), after.st_size, after.st_mtime)
 
 
-def scan(root, exclusions=False):
+def scan(root, exclusions=False, skip_files=(), skipped=None):
     if not root.is_dir() or root.is_symlink():
         raise SyncError(f"Directory missing, inaccessible, or symlinked: {root}")
     files, directories = {}, set()
@@ -115,7 +115,12 @@ def scan(root, exclusions=False):
             directories.add(path.relative_to(root).as_posix())
         for name in names:
             path = base / name
-            files[path.relative_to(root).as_posix()] = inspect(path)
+            rel = path.relative_to(root).as_posix()
+            if rel in skip_files:
+                if skipped is not None:
+                    skipped.add(rel)
+                continue
+            files[rel] = inspect(path)
     return files, directories
 
 
@@ -342,7 +347,41 @@ class Job:
         self.master_files, self.desired_dirs = scan(self.master, exclusions=True)
         check_case_collisions(self.master_files, self.desired_dirs, "master vault")
         desired = dict(self.master_files)
-        self.phone_files, self.phone_dirs = scan(self.phone, exclusions=True)
+        # An exact stale alias left by our failed CREATE must not force us to
+        # read/delete a case-insensitive alias of a wanted, differently-cased
+        # note. Never generalize this to unknown unreadable files or External.
+        aliases = dict(self.state.get("abandoned_phone_aliases", {}))
+        candidate = getattr(self, "abandoned_create", None)
+        if candidate:
+            rel = candidate["path"]
+            for kept in self.master_files:
+                if (rel != kept and rel.casefold() == kept.casefold()
+                        and Path(rel).parent == Path(kept).parent):
+                    aliases[rel] = {"kept": kept, "origin_run": candidate["run"]}
+        aliases = {
+            rel: record for rel, record in aliases.items()
+            if rel not in self.master_files
+            and Path(rel).parts[0].casefold() != "external"
+            and record["kept"] in self.master_files
+            and rel != record["kept"]
+            and rel.casefold() == record["kept"].casefold()
+            and Path(rel).parent == Path(record["kept"]).parent
+        }
+        self.state["abandoned_phone_aliases"] = aliases
+        skipped = set()
+        self.phone_files, self.phone_dirs = scan(
+            self.phone, exclusions=True, skip_files=aliases, skipped=skipped)
+        for rel, record in sorted(aliases.items()):
+            kept = record["kept"]
+            if rel in skipped and kept not in self.phone_files:
+                # The retained path must be readable. This also guarantees a
+                # real before-image if a later write through that alias occurs.
+                self.phone_files[kept] = inspect(self.phone / kept)
+            self.messages.append(
+                f"PHONE ALIAS EXCEPTION: {rel}; abandoned failed create; "
+                f"retained path {kept} will be verified. "
+                "Old exact-name entry is not read or deleted; strict mirror excludes it."
+            )
         if getattr(self, "reconcile_cursor", None) or not self.initial:
             journal = self.collect(
                 "phone", self.phone / "External/Journal",
@@ -400,6 +439,10 @@ class Job:
         # receipts, but do not set initialized or last_success.
         job.state = json.loads(json.dumps(self.state))
         job.reconcile_cursor = dict(self.progress)
+        if phase == "pushes" and self.progress["inflight"]:
+            rel, _, old = self.pushes[self.progress["index"]]
+            if old is None and Path(rel).parts[0].casefold() != "external":
+                job.abandoned_create = {"path": rel, "run": self.progress["run"]}
         # Remember journal versions that were already present/copied on the
         # phone, only for moved-file suppression, never to arbitrate contents.
         completed_writes = {
@@ -683,6 +726,9 @@ class Job:
         if self.progress["phase"] == "complete":
             (self.state_path.parent / "active-run.json").unlink()
             print("SUCCESS. Changed/deleted originals and operation log:", self.backup)
+            if self.state.get("abandoned_phone_aliases"):
+                print("NOTE: Desired content verified; strict mirror has recorded "
+                      "abandoned-name exceptions. Those old alias entries were not read or deleted.")
             return True
         raise SyncError(f"Unknown cursor phase: {self.progress['phase']}")
 

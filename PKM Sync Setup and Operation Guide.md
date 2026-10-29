@@ -1,8 +1,8 @@
 # PKM collect-then-push sync
 
-Version 2.2.1 uses the laptop as the authoritative Obsidian vault. It is not general-purpose bidirectional sync. Apply requires one approval in a terminal or the optional Zenity review dialog, then all batches continue automatically through final verification. The implementation was tested with mock local filesystems, not with the actual Android MTP mount. Preview the real device before applying.
+Version 2.3.2 uses the laptop as the complete master Obsidian vault, while external sources own same-path content within their intake folders. It is not general-purpose bidirectional sync. Apply requires one approval in a terminal or the optional Zenity review dialog, then all batches continue automatically through final verification. The implementation was tested with mock local filesystems, not with the actual Android MTP mount. Preview the real device before applying.
 
-Validation: 45 automated tests passed, including pending-only resume displays, mount-disconnect guards, GUI approval/cancellation, watcher behavior, phone-vault discovery/overrides, automatic continuation without batch prompts, compatibility with version 2.0 paused cursors, in-flight overwrite/create/deletion retries, backup preservation, and cursor resumption without phone rescanning. The version 2.0 transfer path also passed a local stress test of 1,300 writes and final read-back verification in nine 300-operation batches under a 32-file-descriptor limit; descriptor counts were five before and five afterward. This establishes bounded descriptor use in the tested Python path, not absence of resource issues in an external MTP daemon.
+Validation: 83 automated tests passed, including narrow abandoned-create alias exceptions, case-collision preflight, safe interrupted-write reconciliation, source-wins imports, verification recovery with preserved cursors/backups, pending-only resume displays, mount-disconnect guards, GUI approval/cancellation, watcher behavior, phone-vault discovery/overrides, automatic continuation without batch prompts, compatibility with version 2.0 paused cursors, in-flight overwrite/create/deletion retries, backup preservation, and cursor resumption without phone rescanning. The version 2.0 transfer path also passed a local stress test of 1,300 writes and final read-back verification in nine 300-operation batches under a 32-file-descriptor limit; descriptor counts were five before and five afterward. This establishes bounded descriptor use in the tested Python path, not absence of resource issues in an external MTP daemon.
 
 ## Descriptor-exhaustion fix and recovery from version 1
 
@@ -43,6 +43,33 @@ After each completed operation, the local cursor is saved. At an automatic batch
 ```
 
 Do not repeat `--initial` or `--mirror` with `--resume`: their original values are frozen in the saved plan. Resume does not rescan/replan the whole phone. Version 2.0 cursors work with version 2.1, including a cursor already in the verification phase. If the old run has not reported `SUCCESS`, resume rather than starting a new plan.
+
+### Verification or phone writes stopped after legitimate edits/renames
+
+Do not delete journal entries to satisfy a stale verification hash. For a `verify` cursor with `inflight: false`, or a `pushes` cursor without an interrupted Journal write, version 2.3.2 can explicitly replace the frozen plan while preserving its history:
+
+```bash
+# Preview only.
+"$HOME/.local/bin/pkm-sync" --reconcile
+# Review a freshly computed replacement plan and approve once.
+"$HOME/.local/bin/pkm-sync" --reconcile --apply
+```
+
+Reconciliation collects phone journals with the phone authoritative, and Drive entries with Drive authoritative, without timestamp or three-way version arbitration. It retains master-only files. After approval, it snapshots current phone journal files in the new backup's `reconciliation/phone/External/Journal/` directory and saves the prior cursor as `superseded-active-run.json`. Old plans/backups/logs remain intact. It then replaces the active cursor atomically, performs the freshly planned imports/return/mirror work, and verifies the new desired contents. It does not mark the old run successful or initialized.
+
+Existing master files overwritten by imports are backed up under `master/` as usual. If journal preservation fails before cursor replacement, the old active cursor remains. Once a new active cursor exists, an interrupted recovery uses ordinary `--resume --apply`. Do not combine `--reconcile` with `--resume`, `--initial`, `--mirror`, or `--phone-vault`; it retains the saved paths and mirror policy. Both vaults must remain inactive.
+
+For an interrupted non-journal phone write, imports already completed, so the fresh plan can account for a renamed master file and a partial phone destination. Any overwrite/deletion of that partial destination receives a new backup; original backups from the superseded run remain unchanged. An interrupted Journal write cannot be reconciled this way, because pulling its partial phone copy would risk replacing a valid master journal.
+
+### Case-only name collisions
+
+Preflight conservatively rejects filenames or directories that differ only by case in the master or aggregated desired vault, before content transfer. The same check protects application of older frozen plans. It does not test every Android filename restriction or determine the actual device's case sensitivity.
+
+Preserve distinct contents and rename one note clearly in Obsidian, for example `Note.md` and `note.md` becoming `Note.md` and `Note - alternate.md`. Do not merge or delete notes based only on similar names. An eligible active plan can then be explicitly reconciled; an unchanged old plan still refers to old paths and should not be resumed after a rename.
+
+If you deliberately remove an unwanted source after a failed outbound create, reconciliation can handle its unreadable phone alias without touching the retained case-variant note. The saved operation must be an in-flight create with no original destination; its exact master path must be absent; a differently-cased note in the same master directory must remain wanted. External paths are never eligible.
+
+The preview labels this `PHONE ALIAS EXCEPTION`. The abandoned exact-name entry is not read or deleted, but the retained canonical note must be read and verified. Unknown unreadable files, prior replacement operations, and unreadable retained notes still stop recovery. Approved exceptions persist as `abandoned_phone_aliases` in state and saved plans, and future regular syncs honor them only while eligibility remains valid. This is explicitly not a strict mirror of exact filenames or proof that phone metadata has been repaired; successful desired-content verification prints an exception notice.
 
 For optional troubleshooting only, add `--pause-after-batch` to stop deliberately after one batch. This is no longer the default.
 
@@ -157,7 +184,7 @@ The phases are strictly ordered:
 - **Drive gate:** Run the installed mount guard. Mount/recovery or live API failure stops the job.
 - **Phone collection:** Read phone `External/Journal` and plan imports into laptop `External/Journal`.
 - **Muse collection:** Read Drive `Muse` and plan imports into laptop `External/Google_Drive`.
-- **Master imports:** Add new content; replace older same-path external copies when the source timestamp is newer. Back up replaced master files first.
+- **Master imports:** Add new content; an external source replaces a differing same-path external master copy regardless of timestamp. Back up replaced master files first.
 - **Phone return:** Copy the aggregated laptop content, verifying checksums. Back up replaced phone files first.
 - **Mirror cleanup:** Only after all outbound copies succeed, back up and remove obsolete included phone files. Remove obsolete directories only if empty.
 - **Verification:** Read back every included phone file and compare its SHA-256 with the planned master version. Save receipts only after success.
@@ -169,13 +196,12 @@ Any failure stops the operation. This is not an atomic whole-vault transaction: 
 Both incoming feeds preserve destination-only master files. They never perform inbound deletion.
 
 - Unseen source files are imported.
-- Different content replaces the external master copy only when its source modification time is more than two seconds newer.
-- A newer master copy is retained.
-- Different contents with timestamps within two seconds cause the job to stop for manual resolution. MTP timestamps are not assumed to be authoritative in ambiguous cases.
-- Previously handled source path/content-hash pairs are skipped. This prevents a persistent source original from resurrecting a note you moved or deleted in the master.
-- A deliberately rejected older source version is remembered too, so it cannot later resurrect after you move the newer master.
+- A differing same-path external source copy wins, regardless of timestamp or edits to the master copy. The phone owns Journal; Drive owns Google_Drive.
+- Checksums detect unchanged content and verify transfers; they do not arbitrate source ownership.
+- Previously handled source path/content-hash pairs are skipped only when the corresponding master intake path is absent. This prevents a persistent source original from resurrecting an already imported note you moved or deleted.
+- An existing same-path master copy can still be overwritten by its authoritative source even if that source version was receipted previously.
 
-Receipts mean this is an ingestion workflow, not continuous reconciliation: a previously handled source version is not reapplied just because it still exists. If the source content changes again, that new version is reconsidered.
+Move notes outside the intake folders to edit them independently. A changed source version can be imported again even if an earlier version was moved.
 
 Keep `~/.local/state/pkm-sync/state.json`: losing it loses import receipts and can cause moved imports to reappear. Do not edit it casually.
 
@@ -207,7 +233,7 @@ This is therefore a mirror of included vault content, not a byte-identical clone
 - Phone writes avoid MTP renames and use verified direct writes with a durable in-flight cursor and local pre-change backups. This is not atomic; resume can retry a partially written file. Local mock tests do not establish device compatibility.
 - MTP may not preserve timestamps; the script warns if timestamp-setting fails. Phone return comparisons use hashes, not timestamps.
 - No unattended `--apply` is allowed. Mirror deletion requires both `--mirror` and terminal confirmation or explicit approval of the graphical plan-review dialog.
-- Changes in a source file's bytes are detected with SHA-256; timestamps are used only to resolve competing incoming versions.
+- Changes in a source file's bytes are detected with SHA-256; timestamps never decide which incoming version wins.
 - Keep the phone inactive through completion. Keep the master quiescent too; a checksum check cannot prevent an external writer changing a file immediately afterward.
 - Full-file hashing and read-back verification can be slow over MTP. The terminal may appear quiet during enumeration.
 - A successful empty Muse listing is valid and does not delete existing master imports.
