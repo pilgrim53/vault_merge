@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 # Run directly, or source this file and call pkm_ensure_gdrive.
 # Does not copy, overwrite, or delete any PKM or Google Drive files.
+# Read-write era (added 2026-11-22, Martin's direction): the mount itself is
+# made writable in rclone-gdrive.service (remove --read-only, add
+# --vfs-cache-mode writes). This guard stays a checker: when
+# PKM_GDRIVE_REQUIRE_WRITABLE=1 is set by the caller, it additionally proves
+# writability with a self-deleting probe file before any sync phase runs.
+# Martin chooses what enters gdrive:Muse; the guard only verifies the door.
 
 pkm_gdrive_log() {
     printf '[%s] gdrive: %s\n' "$(date '+%F %T %Z')" "$*" >&2
@@ -15,6 +21,17 @@ pkm_gdrive_mount_readable() {
     identity="$(pkm_gdrive_identity)" || return 1
     [[ "$identity" =~ ^gdrive:[[:space:]]+fuse\.rclone$ ]] || return 1
     timeout 20s ls -A -- "$HOME/gdrive/Muse" >/dev/null 2>&1
+}
+
+pkm_gdrive_mount_writable() {
+    local probe
+    pkm_gdrive_mount_readable || return 1
+    probe="$HOME/gdrive/Muse/.pkm-write-probe-$$"
+    if ! timeout 20s sh -c 'printf "pkm\n" > "$1"' _ "$probe" 2>/dev/null; then
+        rm -f -- "$probe" 2>/dev/null
+        return 1
+    fi
+    timeout 20s rm -f -- "$probe" 2>/dev/null
 }
 
 pkm_ensure_gdrive() {
@@ -59,6 +76,15 @@ pkm_ensure_gdrive() {
             pkm_gdrive_log "Expected gdrive: mount or readable Muse folder still absent. Sync must stop."
             return 1
         fi
+    fi
+
+    if [[ "${PKM_GDRIVE_REQUIRE_WRITABLE:-0}" == 1 ]]; then
+        if ! pkm_gdrive_mount_writable; then
+            pkm_gdrive_log "Writable required but the write probe failed (mount still read-only?). Sync must stop."
+            pkm_gdrive_log "Fix: remove --read-only and add --vfs-cache-mode writes in rclone-gdrive.service, then daemon-reload and restart it."
+            return 1
+        fi
+        pkm_gdrive_log "Mount writable (probe passed)."
     fi
 
     # A cached FUSE listing alone does not prove current Google API access.
