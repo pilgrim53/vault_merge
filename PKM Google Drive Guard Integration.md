@@ -48,3 +48,13 @@ Do not simply source the guard without calling `pkm_ensure_gdrive`, and do not i
 - It does not change ownership, use `--allow-non-empty`, force unmount, or copy/delete any Drive or vault content.
 
 Recovery uses the existing service definition, including its unmount behavior. A busy/stale mount or a service without working teardown may require manual diagnosis; the guard fails closed rather than forcibly dismantling it. The checks validate readiness at that moment, not continued availability, so later transfer errors must still abort the phone push.
+
+## Read-write mode (added 2026-11-22, Martin's direction)
+
+The mount becomes writable in the service, not in the guard:
+
+1. `systemctl --user edit --full rclone-gdrive.service` — in the `ExecStart` rclone mount line, remove `--read-only` and add `--vfs-cache-mode writes`.
+2. `systemctl --user daemon-reload && systemctl --user restart rclone-gdrive.service`
+3. Callers that require a writable mount (e.g. the journal push in pkm-sync) set `PKM_GDRIVE_REQUIRE_WRITABLE=1` before calling `pkm_ensure_gdrive`. The guard then proves writability with a self-deleting probe file in `~/gdrive/Muse` and fails closed if the probe fails.
+
+Without the variable set, behavior is unchanged (readable is enough). Martin chooses what enters `gdrive:Muse`; the guard only verifies the door.
